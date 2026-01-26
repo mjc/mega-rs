@@ -1251,14 +1251,20 @@ impl Client {
     /// * `node` - The node to download
     /// * `path` - The file path to write to
     /// * `num_connections` - Number of parallel connections to use (recommended: 4-16)
+    /// * `progress` - Optional callback called with bytes downloaded so far
     #[cfg(feature = "reqwest")]
-    pub async fn download_node_parallel(
+    pub async fn download_node_parallel<F>(
         &self,
         node: &Node,
         path: &std::path::Path,
         num_connections: usize,
-    ) -> Result<()> {
+        progress: Option<F>,
+    ) -> Result<()>
+    where
+        F: Fn(u64) + Send + Sync + 'static,
+    {
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
         use tokio::sync::Mutex;
 
         let num_connections = num_connections.max(1);
@@ -1328,6 +1334,10 @@ impl Client {
         file.set_len(file_size)?;
         let file = Arc::new(Mutex::new(file));
 
+        // Progress tracking
+        let bytes_downloaded = Arc::new(AtomicU64::new(0));
+        let progress = progress.map(Arc::new);
+
         // Download all chunks in parallel
         let download_futures: Vec<_> = chunks
             .into_iter()
@@ -1335,6 +1345,8 @@ impl Client {
                 let url_str = format!("{}/{}-{}", base_url, start, end - 1);
                 let file = Arc::clone(&file);
                 let client = &self.client;
+                let bytes_downloaded = Arc::clone(&bytes_downloaded);
+                let progress = progress.clone();
 
                 async move {
                     let url = Url::parse(&url_str)?;
@@ -1384,6 +1396,12 @@ impl Client {
                             let mut f = file.lock().await;
                             f.seek(SeekFrom::Start(offset))?;
                             f.write_all(data)?;
+                        }
+
+                        // Update progress
+                        let total = bytes_downloaded.fetch_add(total_read as u64, Ordering::Relaxed) + total_read as u64;
+                        if let Some(ref cb) = progress {
+                            cb(total);
                         }
 
                         offset += total_read as u64;
