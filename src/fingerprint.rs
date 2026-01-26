@@ -284,3 +284,62 @@ pub async fn compute_condensed_mac<R: AsyncRead>(
 
     Ok(final_mac_data[..8].try_into().unwrap())
 }
+
+/// Computes a condensed MAC from an in-memory buffer.
+///
+/// This is useful when the entire file content is already in memory (e.g., after
+/// parallel chunk downloads).
+pub fn compute_condensed_mac_from_buffer(
+    data: &[u8],
+    size: u64,
+    aes_key: &[u8; 16],
+    aes_iv: &[u8; 8],
+) -> Result<[u8; 8]> {
+    let mut chunk_size: usize = 131_072; // 2^17
+    let mut cur_mac = [0u8; 16];
+
+    let mut final_mac_data = [0u8; 16];
+    let mut final_mac = cbc::Encryptor::<Aes128>::new(aes_key.into(), (&final_mac_data).into());
+
+    let aes_iv_full = {
+        let mut iv = [0u8; 16];
+        iv[..8].copy_from_slice(aes_iv);
+        iv[8..].copy_from_slice(aes_iv);
+        iv
+    };
+
+    let total_size = size as usize;
+    let mut offset = 0;
+
+    while offset < total_size {
+        let end = (offset + chunk_size).min(total_size);
+        let chunk_data = &data[offset..end];
+
+        let (chunks, leftover) = chunk_data.split_at(chunk_data.len() - chunk_data.len() % 16);
+
+        let mut mac = cbc::Encryptor::<Aes128>::new(aes_key.into(), (&aes_iv_full).into());
+        for chunk in chunks.chunks_exact(16) {
+            mac.encrypt_block_b2b_mut(chunk.into(), (&mut cur_mac).into());
+        }
+
+        if !leftover.is_empty() {
+            let mut padded_chunk = [0u8; 16];
+            padded_chunk[..leftover.len()].copy_from_slice(leftover);
+            mac.encrypt_block_b2b_mut((&padded_chunk).into(), (&mut cur_mac).into());
+        }
+
+        final_mac.encrypt_block_b2b_mut((&cur_mac).into(), (&mut final_mac_data).into());
+
+        if chunk_size < 1_048_576 {
+            chunk_size += 131_072;
+        }
+        offset = end;
+    }
+
+    for i in 0..4 {
+        final_mac_data[i] = final_mac_data[i] ^ final_mac_data[i + 4];
+        final_mac_data[i + 4] = final_mac_data[i + 8] ^ final_mac_data[i + 12];
+    }
+
+    Ok(final_mac_data[..8].try_into().unwrap())
+}
