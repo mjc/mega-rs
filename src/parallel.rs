@@ -55,7 +55,11 @@ impl ChunkRange {
     }
 
     fn url(&self, base_url: &str) -> String {
-        format!("{base_url}/{}-{}", self.offset, self.end().saturating_sub(1))
+        format!(
+            "{base_url}/{}-{}",
+            self.offset,
+            self.end().saturating_sub(1)
+        )
     }
 }
 
@@ -85,6 +89,7 @@ struct DownloadContext {
     tx: mpsc::Sender<DownloadedChunk>,
     progress: Option<Arc<dyn Fn(u64) + Send + Sync>>,
     progress_total: Option<Arc<AtomicU64>>,
+    progress_reported: Option<Arc<AtomicU64>>,
 }
 
 async fn download_worker(client: &dyn HttpClient, ctx: DownloadContext) -> Result<()> {
@@ -110,8 +115,15 @@ async fn download_worker(client: &dyn HttpClient, ctx: DownloadContext) -> Resul
                     bytes_read += n;
                     if let Some(ref total) = ctx.progress_total {
                         let new_total = total.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
-                        if let Some(ref cb) = ctx.progress {
-                            cb(new_total);
+                        // Only invoke callback if we advanced the high-water mark,
+                        // ensuring monotonic progress reporting across workers.
+                        if let Some(ref reported) = ctx.progress_reported {
+                            let prev = reported.fetch_max(new_total, Ordering::Relaxed);
+                            if new_total > prev {
+                                if let Some(ref cb) = ctx.progress {
+                                    cb(new_total);
+                                }
+                            }
                         }
                     }
                 }
@@ -170,9 +182,11 @@ where
             }
         })
         .await
-        .map_err(|e| Error::from(std::io::Error::other(
-            format!("spawn_blocking task failed: {e}"),
-        )))?;
+        .map_err(|e| {
+            Error::from(std::io::Error::other(format!(
+                "spawn_blocking task failed: {e}"
+            )))
+        })?;
 
         // Write to file
         writer.seek(SeekFrom::Start(offset)).await?;
@@ -236,16 +250,18 @@ where
     // MAC processor (handles out-of-order chunks)
     let mac = Arc::new(ParallelMacProcessor::new(file_size, &aes_key, &aes_iv_8));
 
-    // Progress callback with cumulative tracking
+    // Progress callback with cumulative tracking and monotonic reporting
     let progress: Option<Arc<dyn Fn(u64) + Send + Sync>> =
         progress_callback.map(|f| Arc::new(f) as _);
     let progress_total = progress.as_ref().map(|_| Arc::new(AtomicU64::new(0)));
+    let progress_reported = progress.as_ref().map(|_| Arc::new(AtomicU64::new(0)));
 
     // Processor task: decrypt, write, MAC
     let processor_mac = Arc::clone(&mac);
-    let processor_handle = tokio::spawn(async move {
-        process_chunks(rx, writer, processor_mac, aes_key, aes_iv_16).await
-    });
+    let processor_handle =
+        tokio::spawn(
+            async move { process_chunks(rx, writer, processor_mac, aes_key, aes_iv_16).await },
+        );
 
     // Download workers
     let download_workers: Vec<_> = (0..num_workers)
@@ -258,6 +274,7 @@ where
                 tx: tx.clone(),
                 progress: progress.clone(),
                 progress_total: progress_total.clone(),
+                progress_reported: progress_reported.clone(),
             };
             download_worker(client, ctx)
         })
@@ -274,11 +291,9 @@ where
     }
 
     // Wait for processor to finish
-    let processor_result: Result<_> = processor_handle.await.map_err(|e| {
-        Error::from(std::io::Error::other(
-            format!("processor task failed: {e}"),
-        ))
-    });
+    let processor_result: Result<_> = processor_handle
+        .await
+        .map_err(|e| Error::from(std::io::Error::other(format!("processor task failed: {e}"))));
 
     // Propagate downloader error if any, otherwise propagate processor error
     if let Some(err) = download_error {
@@ -320,7 +335,10 @@ mod tests {
         assert_eq!(num_chunks, 4); // 32MB + 32MB + 32MB + 4MB
         assert_eq!(ChunkRange::new(0, file_size).length, CHUNK_SIZE);
         assert_eq!(ChunkRange::new(1, file_size).length, CHUNK_SIZE);
-        assert_eq!(ChunkRange::new(3, file_size).length, file_size - 3 * CHUNK_SIZE);
+        assert_eq!(
+            ChunkRange::new(3, file_size).length,
+            file_size - 3 * CHUNK_SIZE
+        );
     }
 
     #[test]

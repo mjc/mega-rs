@@ -162,7 +162,7 @@ async fn upload_and_parallel_download_test() {
         file.compat(),
         4,
         Some(move |bytes: u64| {
-            progress_clone.store(bytes, Ordering::Relaxed);
+            progress_clone.fetch_max(bytes, Ordering::Relaxed);
         }),
     )
     .await

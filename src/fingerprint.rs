@@ -299,8 +299,7 @@ struct ChunkInfo {
 /// final combination step is sequential. This processor stores just the 16-byte
 /// MAC per MEGA chunk (~160KB for a 5GB file) instead of buffering actual data.
 ///
-/// Uses sharded concurrent data structures (DashMap) for high-throughput
-/// parallel access with minimal lock contention.
+/// Uses lock-free atomics (AtomicU64 pairs) for MACs and a Mutex only for partial chunks.
 #[cfg(feature = "parallel")]
 pub struct ParallelMacProcessor {
     aes_key: [u8; 16],
@@ -310,11 +309,13 @@ pub struct ParallelMacProcessor {
     // Pre-computed chunk boundaries for O(1)/O(log n) lookups
     chunk_boundaries: Box<[ChunkInfo]>,
 
-    // Computed MACs per MEGA chunk index (sharded concurrent map)
-    chunk_macs: dashmap::DashMap<usize, [u8; 16]>,
+    // Computed MACs per MEGA chunk: each MAC is 16 bytes stored as two u64 atomics
+    // Use u64::MAX as sentinel for "not computed yet"
+    chunk_macs_lo: Box<[std::sync::atomic::AtomicU64]>,
+    chunk_macs_hi: Box<[std::sync::atomic::AtomicU64]>,
 
     // Partial chunk state: (data buffer, bytes received)
-    chunk_state: dashmap::DashMap<usize, ChunkState>,
+    chunk_state: std::sync::Mutex<Vec<Option<ChunkState>>>,
 }
 
 #[cfg(feature = "parallel")]
@@ -340,7 +341,10 @@ impl ParallelMacProcessor {
             let mut size = 131_072u64;
             while offset < file_size {
                 let actual_size = size.min(file_size - offset);
-                boundaries.push(ChunkInfo { start: offset, size: actual_size });
+                boundaries.push(ChunkInfo {
+                    start: offset,
+                    size: actual_size,
+                });
                 offset += actual_size;
                 if size < 1_048_576 {
                     size += 131_072;
@@ -349,13 +353,19 @@ impl ParallelMacProcessor {
             boundaries.into_boxed_slice()
         };
 
+        let num_chunks = chunk_boundaries.len();
         Self {
             aes_key: *aes_key,
             aes_iv_full,
             file_size,
             chunk_boundaries,
-            chunk_macs: dashmap::DashMap::new(),
-            chunk_state: dashmap::DashMap::new(),
+            chunk_macs_lo: (0..num_chunks)
+                .map(|_| std::sync::atomic::AtomicU64::new(u64::MAX))
+                .collect(),
+            chunk_macs_hi: (0..num_chunks)
+                .map(|_| std::sync::atomic::AtomicU64::new(u64::MAX))
+                .collect(),
+            chunk_state: std::sync::Mutex::new((0..num_chunks).map(|_| None).collect()),
         }
     }
 
@@ -367,7 +377,8 @@ impl ParallelMacProcessor {
             return None;
         }
 
-        let idx = self.chunk_boundaries
+        let idx = self
+            .chunk_boundaries
             .binary_search_by(|info| {
                 if offset < info.start {
                     std::cmp::Ordering::Greater
@@ -397,6 +408,32 @@ impl ParallelMacProcessor {
     fn compute_chunk_mac(&self, data: &[u8]) -> [u8; 16] {
         compute_chunk_mac_inner(&self.aes_key, &self.aes_iv_full, data)
     }
+
+    /// Store a MAC atomically (16 bytes as two u64s)
+    fn store_mac(&self, idx: usize, mac: [u8; 16]) {
+        let lo = u64::from_le_bytes(mac[0..8].try_into().unwrap());
+        let hi = u64::from_le_bytes(mac[8..16].try_into().unwrap());
+        self.chunk_macs_lo[idx].store(lo, std::sync::atomic::Ordering::Release);
+        self.chunk_macs_hi[idx].store(hi, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Load a MAC atomically, returning None if not yet computed (sentinel is u64::MAX)
+    fn load_mac(&self, idx: usize) -> Option<[u8; 16]> {
+        let lo = self.chunk_macs_lo[idx].load(std::sync::atomic::Ordering::Acquire);
+        if lo == u64::MAX {
+            return None;
+        }
+        let hi = self.chunk_macs_hi[idx].load(std::sync::atomic::Ordering::Acquire);
+        let mut mac = [0u8; 16];
+        mac[0..8].copy_from_slice(&lo.to_le_bytes());
+        mac[8..16].copy_from_slice(&hi.to_le_bytes());
+        Some(mac)
+    }
+
+    /// Check if a MAC has been computed (without loading it)
+    fn is_mac_computed(&self, idx: usize) -> bool {
+        self.chunk_macs_lo[idx].load(std::sync::atomic::Ordering::Acquire) != u64::MAX
+    }
 }
 
 /// Standalone MAC computation for use with spawn_blocking
@@ -421,14 +458,17 @@ fn compute_chunk_mac_inner(aes_key: &[u8; 16], aes_iv: &[u8; 16], data: &[u8]) -
 
 #[cfg(feature = "parallel")]
 impl ParallelMacProcessor {
-
     /// Add data at the given file offset. Can be called from multiple threads.
     pub fn add_chunk(&self, offset: u64, data: &[u8]) {
         // Validate that the data range doesn't exceed file size
         if let Some(end_offset) = offset.checked_add(data.len() as u64) {
-            debug_assert!(end_offset <= self.file_size,
+            debug_assert!(
+                end_offset <= self.file_size,
                 "add_chunk: data range [{}, {}) exceeds file_size {}",
-                offset, end_offset, self.file_size);
+                offset,
+                end_offset,
+                self.file_size
+            );
         } else {
             debug_assert!(false, "add_chunk: offset overflow");
         }
@@ -461,17 +501,21 @@ impl ParallelMacProcessor {
 
             // Fast path: complete, aligned chunk - compute MAC directly
             if offset_in_chunk == 0 && to_take == actual_chunk_size {
-                // Use vacant_entry to atomically check and insert, avoiding redundant
-                // computation and ensuring complete_count is only incremented on actual inserts
-                if let dashmap::mapref::entry::Entry::Vacant(entry) = self.chunk_macs.entry(chunk_idx) {
+                // Check if already computed; only increment on actual compute
+                if !self.is_mac_computed(chunk_idx) {
                     let mac = self.compute_chunk_mac(for_this_chunk);
-                    entry.insert(mac);
+                    self.store_mac(chunk_idx, mac);
                     complete_count += 1;
                 }
             } else {
                 // Slow path: partial chunk at boundary - use buffering
                 // buffer_partial_chunk checks chunk_macs internally to skip already-completed chunks
-                self.buffer_partial_chunk(chunk_idx, offset_in_chunk as usize, for_this_chunk, actual_chunk_size);
+                self.buffer_partial_chunk(
+                    chunk_idx,
+                    offset_in_chunk as usize,
+                    for_this_chunk,
+                    actual_chunk_size,
+                );
             }
 
             pos += to_take as u64;
@@ -483,39 +527,45 @@ impl ParallelMacProcessor {
 
     /// Buffer partial chunk data, computing MAC when complete.
     /// Safe to call concurrently: skips chunks whose MAC was already computed.
-    fn buffer_partial_chunk(&self, chunk_idx: usize, offset_in_chunk: usize, data: &[u8], actual_chunk_size: usize) {
+    fn buffer_partial_chunk(
+        &self,
+        chunk_idx: usize,
+        offset_in_chunk: usize,
+        data: &[u8],
+        actual_chunk_size: usize,
+    ) {
         // Skip if another thread already completed this chunk's MAC
-        if self.chunk_macs.contains_key(&chunk_idx) {
+        if self.is_mac_computed(chunk_idx) {
             return;
         }
 
         let mut completed_data = None;
 
-        self.chunk_state
-            .entry(chunk_idx)
-            .and_modify(|state| {
+        {
+            let mut states = self.chunk_state.lock().unwrap();
+            if let Some(state) = &mut states[chunk_idx] {
                 state.data[offset_in_chunk..offset_in_chunk + data.len()].copy_from_slice(data);
                 state.bytes_received += data.len();
 
                 if state.bytes_received == actual_chunk_size {
                     completed_data = Some(std::mem::take(&mut state.data));
                 }
-            })
-            .or_insert_with(|| {
+            } else {
                 let mut buf = vec![0u8; actual_chunk_size];
                 buf[offset_in_chunk..offset_in_chunk + data.len()].copy_from_slice(data);
 
-                ChunkState {
+                states[chunk_idx] = Some(ChunkState {
                     data: buf,
                     bytes_received: data.len(),
-                }
-            });
+                });
+            }
+        }
 
         // If chunk is complete, compute MAC and clean up
         if let Some(data) = completed_data {
             let mac = self.compute_chunk_mac(&data);
-            self.chunk_macs.insert(chunk_idx, mac);
-            self.chunk_state.remove(&chunk_idx);
+            self.store_mac(chunk_idx, mac);
+            self.chunk_state.lock().unwrap()[chunk_idx] = None;
         }
     }
 
@@ -524,17 +574,20 @@ impl ParallelMacProcessor {
         let num_chunks = self.chunk_boundaries.len();
 
         // Verify we have all chunks
-        if self.chunk_macs.len() != num_chunks {
-            return None;
+        for idx in 0..num_chunks {
+            if !self.is_mac_computed(idx) {
+                return None;
+            }
         }
 
         // Combine MACs in order
         let mut final_mac_data = [0u8; 16];
-        let mut final_mac = cbc::Encryptor::<Aes128>::new((&self.aes_key).into(), (&final_mac_data).into());
+        let mut final_mac =
+            cbc::Encryptor::<Aes128>::new((&self.aes_key).into(), (&final_mac_data).into());
 
         for idx in 0..num_chunks {
-            let cur_mac = self.chunk_macs.get(&idx)?;
-            final_mac.encrypt_block_b2b_mut(cur_mac.value().into(), (&mut final_mac_data).into());
+            let cur_mac = self.load_mac(idx)?;
+            final_mac.encrypt_block_b2b_mut((&cur_mac).into(), (&mut final_mac_data).into());
         }
 
         // XOR to produce final 8-byte MAC
@@ -546,7 +599,6 @@ impl ParallelMacProcessor {
         Some(final_mac_data[..8].try_into().unwrap())
     }
 }
-
 
 /// Computes a condensed MAC from an in-memory buffer.
 ///
@@ -582,8 +634,13 @@ pub fn compute_condensed_mac_from_buffer(
     if total_size > data.len() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("size {} exceeds data buffer length {}", total_size, data.len()),
-        ).into());
+            format!(
+                "size {} exceeds data buffer length {}",
+                total_size,
+                data.len()
+            ),
+        )
+        .into());
     }
 
     let mut offset = 0;
@@ -631,151 +688,167 @@ mod tests {
     ];
     const TEST_IV: [u8; 8] = [0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17];
 
-    #[tokio::test]
-    async fn condensed_mac_buffer_matches_stream() {
-        // Test that compute_condensed_mac_from_buffer produces same result as compute_condensed_mac
-        let data: Vec<u8> = (0..10000).map(|i| (i % 256) as u8).collect();
-        let size = data.len() as u64;
+    #[test]
+    fn condensed_mac_buffer_matches_stream() {
+        futures::executor::block_on(async {
+            // Test that compute_condensed_mac_from_buffer produces same result as compute_condensed_mac
+            let data: Vec<u8> = (0..10000).map(|i| (i % 256) as u8).collect();
+            let size = data.len() as u64;
 
-        let stream_mac = {
-            let cursor = futures::io::Cursor::new(&data);
-            compute_condensed_mac(cursor, size, &TEST_KEY, &TEST_IV)
-                .await
-                .unwrap()
-        };
+            let stream_mac = {
+                let cursor = futures::io::Cursor::new(&data);
+                compute_condensed_mac(cursor, size, &TEST_KEY, &TEST_IV)
+                    .await
+                    .unwrap()
+            };
 
-        let buffer_mac =
-            compute_condensed_mac_from_buffer(&data, size, &TEST_KEY, &TEST_IV).unwrap();
+            let buffer_mac =
+                compute_condensed_mac_from_buffer(&data, size, &TEST_KEY, &TEST_IV).unwrap();
 
-        assert_eq!(stream_mac, buffer_mac);
+            assert_eq!(stream_mac, buffer_mac);
+        });
     }
 
-    #[tokio::test]
-    async fn condensed_mac_buffer_matches_stream_large() {
-        // Test with larger data that spans multiple MEGA chunks (>128KB)
-        let data: Vec<u8> = (0..500_000).map(|i| (i % 256) as u8).collect();
-        let size = data.len() as u64;
+    #[test]
+    fn condensed_mac_buffer_matches_stream_large() {
+        futures::executor::block_on(async {
+            // Test with larger data that spans multiple MEGA chunks (>128KB)
+            let data: Vec<u8> = (0..500_000).map(|i| (i % 256) as u8).collect();
+            let size = data.len() as u64;
 
-        let stream_mac = {
-            let cursor = futures::io::Cursor::new(&data);
-            compute_condensed_mac(cursor, size, &TEST_KEY, &TEST_IV)
-                .await
-                .unwrap()
-        };
+            let stream_mac = {
+                let cursor = futures::io::Cursor::new(&data);
+                compute_condensed_mac(cursor, size, &TEST_KEY, &TEST_IV)
+                    .await
+                    .unwrap()
+            };
 
-        let buffer_mac =
-            compute_condensed_mac_from_buffer(&data, size, &TEST_KEY, &TEST_IV).unwrap();
+            let buffer_mac =
+                compute_condensed_mac_from_buffer(&data, size, &TEST_KEY, &TEST_IV).unwrap();
 
-        assert_eq!(stream_mac, buffer_mac);
+            assert_eq!(stream_mac, buffer_mac);
+        });
     }
 
-    #[tokio::test]
-    async fn condensed_mac_empty_data() {
-        let data: Vec<u8> = vec![];
-        let size = 0u64;
+    #[test]
+    fn condensed_mac_empty_data() {
+        futures::executor::block_on(async {
+            let data: Vec<u8> = vec![];
+            let size = 0u64;
 
-        let stream_mac = {
-            let cursor = futures::io::Cursor::new(&data);
-            compute_condensed_mac(cursor, size, &TEST_KEY, &TEST_IV)
-                .await
-                .unwrap()
-        };
+            let stream_mac = {
+                let cursor = futures::io::Cursor::new(&data);
+                compute_condensed_mac(cursor, size, &TEST_KEY, &TEST_IV)
+                    .await
+                    .unwrap()
+            };
 
-        let buffer_mac =
-            compute_condensed_mac_from_buffer(&data, size, &TEST_KEY, &TEST_IV).unwrap();
+            let buffer_mac =
+                compute_condensed_mac_from_buffer(&data, size, &TEST_KEY, &TEST_IV).unwrap();
 
-        assert_eq!(stream_mac, buffer_mac);
+            assert_eq!(stream_mac, buffer_mac);
+        });
     }
 
-    #[tokio::test]
-    async fn condensed_mac_single_chunk() {
-        // Test with data smaller than one MEGA chunk (128KB)
-        let data: Vec<u8> = (0..50_000).map(|i| (i % 256) as u8).collect();
-        let size = data.len() as u64;
+    #[test]
+    fn condensed_mac_single_chunk() {
+        futures::executor::block_on(async {
+            // Test with data smaller than one MEGA chunk (128KB)
+            let data: Vec<u8> = (0..50_000).map(|i| (i % 256) as u8).collect();
+            let size = data.len() as u64;
 
-        let stream_mac = {
-            let cursor = futures::io::Cursor::new(&data);
-            compute_condensed_mac(cursor, size, &TEST_KEY, &TEST_IV)
-                .await
-                .unwrap()
-        };
+            let stream_mac = {
+                let cursor = futures::io::Cursor::new(&data);
+                compute_condensed_mac(cursor, size, &TEST_KEY, &TEST_IV)
+                    .await
+                    .unwrap()
+            };
 
-        let buffer_mac =
-            compute_condensed_mac_from_buffer(&data, size, &TEST_KEY, &TEST_IV).unwrap();
+            let buffer_mac =
+                compute_condensed_mac_from_buffer(&data, size, &TEST_KEY, &TEST_IV).unwrap();
 
-        assert_eq!(stream_mac, buffer_mac);
+            assert_eq!(stream_mac, buffer_mac);
+        });
     }
 
-    #[tokio::test]
-    async fn condensed_mac_exactly_one_chunk() {
-        // Test with data exactly one MEGA chunk (128KB = 131072 bytes)
-        let data: Vec<u8> = (0..131_072).map(|i| (i % 256) as u8).collect();
-        let size = data.len() as u64;
+    #[test]
+    fn condensed_mac_exactly_one_chunk() {
+        futures::executor::block_on(async {
+            // Test with data exactly one MEGA chunk (128KB = 131072 bytes)
+            let data: Vec<u8> = (0..131_072).map(|i| (i % 256) as u8).collect();
+            let size = data.len() as u64;
 
-        let stream_mac = {
-            let cursor = futures::io::Cursor::new(&data);
-            compute_condensed_mac(cursor, size, &TEST_KEY, &TEST_IV)
-                .await
-                .unwrap()
-        };
+            let stream_mac = {
+                let cursor = futures::io::Cursor::new(&data);
+                compute_condensed_mac(cursor, size, &TEST_KEY, &TEST_IV)
+                    .await
+                    .unwrap()
+            };
 
-        let buffer_mac =
-            compute_condensed_mac_from_buffer(&data, size, &TEST_KEY, &TEST_IV).unwrap();
+            let buffer_mac =
+                compute_condensed_mac_from_buffer(&data, size, &TEST_KEY, &TEST_IV).unwrap();
 
-        assert_eq!(stream_mac, buffer_mac);
+            assert_eq!(stream_mac, buffer_mac);
+        });
     }
 
-    #[tokio::test]
-    async fn condensed_mac_unaligned_size() {
-        // Test with data size not aligned to 16 bytes
-        let data: Vec<u8> = (0..10007).map(|i| (i % 256) as u8).collect();
-        let size = data.len() as u64;
+    #[test]
+    fn condensed_mac_unaligned_size() {
+        futures::executor::block_on(async {
+            // Test with data size not aligned to 16 bytes
+            let data: Vec<u8> = (0..10007).map(|i| (i % 256) as u8).collect();
+            let size = data.len() as u64;
 
-        let stream_mac = {
-            let cursor = futures::io::Cursor::new(&data);
-            compute_condensed_mac(cursor, size, &TEST_KEY, &TEST_IV)
-                .await
-                .unwrap()
-        };
+            let stream_mac = {
+                let cursor = futures::io::Cursor::new(&data);
+                compute_condensed_mac(cursor, size, &TEST_KEY, &TEST_IV)
+                    .await
+                    .unwrap()
+            };
 
-        let buffer_mac =
-            compute_condensed_mac_from_buffer(&data, size, &TEST_KEY, &TEST_IV).unwrap();
+            let buffer_mac =
+                compute_condensed_mac_from_buffer(&data, size, &TEST_KEY, &TEST_IV).unwrap();
 
-        assert_eq!(stream_mac, buffer_mac);
+            assert_eq!(stream_mac, buffer_mac);
+        });
     }
 
-    #[tokio::test]
-    async fn sparse_checksum_small_file() {
-        // Files 17-8192 bytes: full CRC32 coverage
-        let data: Vec<u8> = (0..1000).map(|i| (i % 256) as u8).collect();
-        let cursor = futures::io::Cursor::new(&data);
-        let checksum = compute_sparse_checksum(cursor, data.len() as u64)
-            .await
-            .unwrap();
+    #[test]
+    fn sparse_checksum_small_file() {
+        futures::executor::block_on(async {
+            // Files 17-8192 bytes: full CRC32 coverage
+            let data: Vec<u8> = (0..1000).map(|i| (i % 256) as u8).collect();
+            let cursor = futures::io::Cursor::new(&data);
+            let checksum = compute_sparse_checksum(cursor, data.len() as u64)
+                .await
+                .unwrap();
 
-        // Verify it's not all zeros
-        assert_ne!(checksum, [0u8; 16]);
+            // Verify it's not all zeros
+            assert_ne!(checksum, [0u8; 16]);
+        });
     }
 
-    #[tokio::test]
-    async fn sparse_checksum_deterministic() {
-        let data: Vec<u8> = (0..5000).map(|i| (i % 256) as u8).collect();
+    #[test]
+    fn sparse_checksum_deterministic() {
+        futures::executor::block_on(async {
+            let data: Vec<u8> = (0..5000).map(|i| (i % 256) as u8).collect();
 
-        let checksum1 = {
-            let cursor = futures::io::Cursor::new(&data);
-            compute_sparse_checksum(cursor, data.len() as u64)
-                .await
-                .unwrap()
-        };
+            let checksum1 = {
+                let cursor = futures::io::Cursor::new(&data);
+                compute_sparse_checksum(cursor, data.len() as u64)
+                    .await
+                    .unwrap()
+            };
 
-        let checksum2 = {
-            let cursor = futures::io::Cursor::new(&data);
-            compute_sparse_checksum(cursor, data.len() as u64)
-                .await
-                .unwrap()
-        };
+            let checksum2 = {
+                let cursor = futures::io::Cursor::new(&data);
+                compute_sparse_checksum(cursor, data.len() as u64)
+                    .await
+                    .unwrap()
+            };
 
-        assert_eq!(checksum1, checksum2);
+            assert_eq!(checksum1, checksum2);
+        });
     }
 
     #[test]

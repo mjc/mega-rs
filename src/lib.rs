@@ -28,11 +28,11 @@ mod sessions;
 mod utils;
 
 pub use crate::error::{Error, ErrorCode, Result};
+#[cfg(feature = "parallel")]
+pub use crate::fingerprint::ParallelMacProcessor;
 pub use crate::fingerprint::{
     compute_condensed_mac, compute_condensed_mac_from_buffer, compute_sparse_checksum,
 };
-#[cfg(feature = "parallel")]
-pub use crate::fingerprint::ParallelMacProcessor;
 pub use crate::protocol::commands::{FileNode, NodeKind};
 pub use crate::sessions::SessionInfo;
 pub use crate::utils::StorageQuotas;
@@ -1350,7 +1350,16 @@ impl Client {
         F: Fn(u64) + Send + Sync + 'static,
     {
         let (base_url, server_size) = self.get_download_url(node).await?;
-        parallel::download_parallel(&*self.client, node, base_url, server_size, writer, num_connections, progress).await
+        parallel::download_parallel(
+            &*self.client,
+            node,
+            base_url,
+            server_size,
+            writer,
+            num_connections,
+            progress,
+        )
+        .await
     }
 
     /// Uploads a file within a parent folder.
@@ -2891,4 +2900,3 @@ pub struct UserInfo {
     /// The country code of the user.
     pub country_code: Option<String>,
 }
-
