@@ -19,14 +19,14 @@ use crate::{ClientState, ErrorCode};
 
 #[async_trait]
 impl HttpClient for reqwest::Client {
-    #[tracing::instrument(skip(self, state, query_params))]
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn send_requests(
         &self,
         state: &ClientState,
         requests: &[Request],
         query_params: &[(&str, &str)],
     ) -> Result<Vec<Response>> {
-        tracing::trace!(?self, ?state, "preparing MEGA request");
+        tracing::trace!("preparing MEGA request");
 
         let url = {
             let mut url = state.origin.join("/cs")?;

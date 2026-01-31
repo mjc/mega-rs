@@ -31,6 +31,7 @@ rand = "0.8.5"
 chrono = "0.4.38"
 static_assertions = "1.1.0"
 zeroize = { version = "1.8.1", features = ["derive"] }
+dashmap = { version = "6", optional = true }
 
 # Cryptography
 aes = "0.8.4"
@@ -49,17 +50,21 @@ crc32fast = "1.4.2"
 hmac = "0.12.1"
 
 # `reqwest` support
-reqwest = { version = "0.12.8", features = ["json", "stream"], optional = true }
+reqwest = { version = "0.12.8", default-features = false, features = ["json", "stream", "charset", "http2", "macos-system-configuration"], optional = true }
 tokio = { version = "1.40.0", features = ["time"], optional = true }
 tokio-util = { version = "0.7.12", features = ["compat", "codec"], optional = true }
+bytes = { version = "1", optional = true }
 
 # Logging
 tracing = "0.1.40"
 secrecy = { version = "0.10.2", features = ["serde"] }
 
 [features]
-default = ["reqwest"]
-reqwest = ["dep:reqwest", "dep:tokio", "dep:tokio-util"]
+default = ["reqwest", "rustls-tls"]
+reqwest = ["dep:reqwest", "dep:tokio", "dep:tokio-util", "dep:bytes"]
+parallel = ["dep:dashmap", "reqwest"]
+native-tls = ["reqwest", "reqwest/native-tls"]
+rustls-tls = ["reqwest", "reqwest/rustls-tls"]
 
 [dev-dependencies]
 async-read-progress = "0.2.0"

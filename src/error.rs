@@ -56,6 +56,9 @@ pub enum Error {
     /// Failed condensed MAC verification.
     #[error("condensed MAC mismatch")]
     CondensedMacMismatch,
+    /// Node is not a file (e.g., attempting to download a folder).
+    #[error("node is not a file")]
+    NotAFileNode,
     /// Failed to find node.
     #[error("failed to find node")]
     NodeNotFound,

@@ -21,12 +21,18 @@ mod attributes;
 mod error;
 mod fingerprint;
 mod http;
+#[cfg(feature = "parallel")]
+mod parallel;
 mod protocol;
 mod sessions;
 mod utils;
 
 pub use crate::error::{Error, ErrorCode, Result};
-pub use crate::fingerprint::{compute_condensed_mac, compute_condensed_mac_from_buffer, compute_sparse_checksum};
+pub use crate::fingerprint::{
+    compute_condensed_mac, compute_condensed_mac_from_buffer, compute_sparse_checksum,
+};
+#[cfg(feature = "parallel")]
+pub use crate::fingerprint::ParallelMacProcessor;
 pub use crate::protocol::commands::{FileNode, NodeKind};
 pub use crate::sessions::SessionInfo;
 pub use crate::utils::StorageQuotas;
@@ -786,9 +792,9 @@ impl Client {
     /// - https://mega.nz/folder/{node_id}#{node_key}
     #[allow(rustdoc::bare_urls)]
     pub async fn fetch_public_nodes(&self, url: &str) -> Result<Nodes> {
-        let payload = match url.split_at(16) {
-            ("https://mega.nz/", payload) => payload,
-            _ => {
+        let payload = match url.strip_prefix("https://mega.nz/") {
+            Some(payload) => payload,
+            None => {
                 return Err(Error::InvalidPublicUrlFormat);
             }
         };
@@ -1130,8 +1136,8 @@ impl Client {
         })
     }
 
-    /// Downloads a file into the given writer.
-    pub async fn download_node<W: AsyncWrite>(&self, node: &Node, writer: W) -> Result<()> {
+    /// Fetches the download URL and server-reported size for a node from MEGA's servers.
+    async fn get_download_url(&self, node: &Node) -> Result<(String, u64)> {
         let responses = if let Some(download_id) = node.download_id() {
             let request = if node.handle.as_str() == download_id {
                 Request::Download {
@@ -1163,32 +1169,78 @@ impl Client {
             self.send_requests(&[request]).await?
         };
 
-        let response = match responses.as_slice() {
-            [Response::Download(response)] => response,
-            [Response::Error(code)] => {
-                return Err(Error::from(*code));
-            }
-            _ => {
-                return Err(Error::InvalidResponseType);
-            }
-        };
+        match responses.as_slice() {
+            [Response::Download(response)] => Ok((response.download_url.clone(), response.size)),
+            [Response::Error(code)] => Err(Error::from(*code)),
+            _ => Err(Error::InvalidResponseType),
+        }
+    }
 
-        let url =
-            Url::parse(format!("{0}/{1}-{2}", response.download_url, 0, response.size).as_str())?;
+    /// Downloads a file into the given writer using a single connection.
+    ///
+    /// This is the simplest download method, suitable for smaller files or when
+    /// a single connection is preferred. For better performance on large files,
+    /// consider using [`download_node_parallel`](Self::download_node_parallel).
+    ///
+    /// # Arguments
+    /// * `node` - The node to download
+    /// * `writer` - An async writer to write the decrypted file contents to
+    pub async fn download_node<W: AsyncWrite>(&self, node: &Node, writer: W) -> Result<()> {
+        self.download_node_with_progress::<_, fn(u64)>(node, writer, None)
+            .await
+    }
 
-        let mut reader = self.client.get(url).await?.take(node.size);
+    /// Downloads a file with optional progress tracking via a single connection.
+    ///
+    /// Provides the same functionality as [`download_node`](Self::download_node)
+    /// but allows monitoring download progress via a callback. For faster downloads
+    /// on large files, use [`download_node_parallel`](Self::download_node_parallel).
+    ///
+    /// # Arguments
+    /// * `node` - The node to download
+    /// * `writer` - An async writer to write the decrypted file contents to
+    /// * `progress` - Optional callback invoked with cumulative bytes downloaded so far
+    pub async fn download_node_with_progress<W: AsyncWrite, F>(
+        &self,
+        node: &Node,
+        writer: W,
+        progress: Option<F>,
+    ) -> Result<()>
+    where
+        F: Fn(u64),
+    {
+        use std::sync::Arc;
+
+        if !node.kind.is_file() {
+            return Err(Error::NotAFileNode);
+        }
+
+        let (base_url, server_size) = self.get_download_url(node).await?;
+        let size = server_size;
+        // Use inclusive end range (MEGA API expects end byte inclusive), or early return for empty files
+        if size == 0 {
+            if let Some(cb) = progress {
+                cb(0);
+            }
+            return Ok(());
+        }
+        let url = Url::parse(&format!("{base_url}/0-{}", size - 1))?;
+
+        let mut reader = self.client.get(url).await?.take(size);
 
         let mut file_iv = [0u8; 16];
 
         file_iv[..8].copy_from_slice(node.aes_iv.unwrap_or_default().as_slice());
         let mut ctr = ctr::Ctr128BE::<Aes128>::new(node.aes_key[..].into(), (&file_iv).into());
 
-        file_iv[8..].copy_from_slice(node.aes_iv.unwrap_or_default().as_slice());
-
         let (condensed_mac_reader, condensed_mac_writer) = sluice::pipe::pipe();
+
+        // Progress tracking
+        let progress = progress.map(Arc::new);
 
         let download_future = async move {
             let mut chunk_size: u64 = 131_072; // 2^17
+            let mut total_written = 0u64;
 
             let mut buffer = {
                 let chunk_size = usize::try_from(chunk_size).unwrap();
@@ -1214,6 +1266,11 @@ impl Client {
                 writer.write_all(&buffer).await?;
                 condensed_mac_writer.write_all(&buffer).await?;
 
+                total_written += bytes_read as u64;
+                if let Some(ref cb) = progress {
+                    cb(total_written);
+                }
+
                 if chunk_size < 1_048_576 {
                     chunk_size += 131_072;
                 }
@@ -1223,7 +1280,6 @@ impl Client {
         };
 
         let condensed_mac_future = {
-            let size = node.size;
             let aes_key = node.aes_key;
             let aes_iv = node.aes_iv.unwrap();
             async move {
@@ -1243,186 +1299,58 @@ impl Client {
 
     /// Downloads a file using multiple parallel connections for improved speed.
     ///
-    /// This method splits the file into `num_connections` chunks and downloads them
-    /// concurrently, writing directly to the output file to avoid buffering
-    /// the entire file in memory.
+    /// This method is optimized for larger files where bandwidth efficiency matters.
+    /// It downloads file chunks in parallel while maintaining the integrity of the file
+    /// through streaming MAC verification, avoiding full buffering of the decrypted data.
+    ///
+    /// **Architecture:**
+    /// - Multiple download workers fetch 32MB chunks concurrently from the server
+    /// - A single processor task decrypts chunks in-place and writes them to the output writer
+    /// - MAC verification uses sharded concurrent data structures to store only 16-byte MACs
+    ///   per MEGA chunk, keeping memory usage bounded even for very large files
     ///
     /// # Arguments
     /// * `node` - The node to download
-    /// * `path` - The file path to write to
-    /// * `num_connections` - Number of parallel connections to use (recommended: 4-16)
-    /// * `progress` - Optional callback called with bytes downloaded so far
-    #[cfg(feature = "reqwest")]
-    pub async fn download_node_parallel<F>(
+    /// * `writer` - An async writer that supports seeking (e.g., any `futures::io::AsyncWrite + AsyncSeek`)
+    /// * `num_connections` - Number of parallel download workers (recommended: 4-8 for optimal throughput)
+    #[cfg(feature = "parallel")]
+    pub async fn download_node_parallel<W>(
         &self,
         node: &Node,
-        path: &std::path::Path,
+        writer: W,
+        num_connections: usize,
+    ) -> Result<()>
+    where
+        W: futures::io::AsyncWrite + futures::io::AsyncSeek + Unpin + Send + 'static,
+    {
+        self.download_node_parallel_with_progress::<_, fn(u64)>(node, writer, num_connections, None)
+            .await
+    }
+
+    /// Downloads a file using multiple parallel connections with progress tracking.
+    ///
+    /// Same as [`download_node_parallel`](Self::download_node_parallel) but with
+    /// an optional progress callback.
+    ///
+    /// # Arguments
+    /// * `node` - The node to download
+    /// * `writer` - An async writer that supports seeking (e.g., any `futures::io::AsyncWrite + AsyncSeek`)
+    /// * `num_connections` - Number of parallel download workers (recommended: 4-8 for optimal throughput)
+    /// * `progress` - Optional callback invoked with the cumulative number of bytes downloaded so far
+    #[cfg(feature = "parallel")]
+    pub async fn download_node_parallel_with_progress<W, F>(
+        &self,
+        node: &Node,
+        writer: W,
         num_connections: usize,
         progress: Option<F>,
     ) -> Result<()>
     where
+        W: futures::io::AsyncWrite + futures::io::AsyncSeek + Unpin + Send + 'static,
         F: Fn(u64) + Send + Sync + 'static,
     {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicU64, Ordering};
-        use tokio::sync::Mutex;
-
-        let num_connections = num_connections.max(1);
-
-        // Get the download URL
-        let responses = if let Some(download_id) = node.download_id() {
-            let request = if node.handle.as_str() == download_id {
-                Request::Download {
-                    g: 1,
-                    ssl: if self.state.https { 2 } else { 0 },
-                    n: None,
-                    p: Some(node.handle.clone().into()),
-                }
-            } else {
-                Request::Download {
-                    g: 1,
-                    ssl: if self.state.https { 2 } else { 0 },
-                    n: Some(node.handle.clone().into()),
-                    p: None,
-                }
-            };
-
-            self.client
-                .send_requests(&self.state, &[request], &[("n", download_id)])
-                .await?
-        } else {
-            let request = Request::Download {
-                g: 1,
-                ssl: if self.state.https { 2 } else { 0 },
-                p: None,
-                n: Some(node.handle.clone().into()),
-            };
-
-            self.send_requests(&[request]).await?
-        };
-
-        let response = match responses.as_slice() {
-            [Response::Download(response)] => response,
-            [Response::Error(code)] => {
-                return Err(Error::from(*code));
-            }
-            _ => {
-                return Err(Error::InvalidResponseType);
-            }
-        };
-
-        let file_size = node.size;
-        let base_url = response.download_url.clone();
-
-        // Calculate chunk boundaries
-        let chunk_size = (file_size + num_connections as u64 - 1) / num_connections as u64;
-        let chunks: Vec<(u64, u64)> = (0..num_connections)
-            .map(|i| {
-                let start = i as u64 * chunk_size;
-                let end = ((i as u64 + 1) * chunk_size).min(file_size);
-                (start, end)
-            })
-            .filter(|(start, end)| start < end)
-            .collect();
-
-        // Prepare encryption key and IV
-        let aes_key = node.aes_key;
-        let aes_iv = node.aes_iv.unwrap_or_default();
-
-        // Create output file and pre-allocate
-        let file = std::fs::File::create(path)?;
-        file.set_len(file_size)?;
-        let file = Arc::new(Mutex::new(file));
-
-        // Progress tracking
-        let bytes_downloaded = Arc::new(AtomicU64::new(0));
-        let progress = progress.map(Arc::new);
-
-        // Download all chunks in parallel
-        let download_futures: Vec<_> = chunks
-            .into_iter()
-            .map(|(start, end)| {
-                let url_str = format!("{}/{}-{}", base_url, start, end - 1);
-                let file = Arc::clone(&file);
-                let client = &self.client;
-                let bytes_downloaded = Arc::clone(&bytes_downloaded);
-                let progress = progress.clone();
-
-                async move {
-                    let url = Url::parse(&url_str)?;
-                    let mut reader = client.get(url).await?;
-
-                    // Read in smaller sub-chunks to avoid huge allocations
-                    const BUFFER_SIZE: usize = 8 * 1024 * 1024; // 8MB buffers
-                    let mut offset = start;
-                    let mut buffer = vec![0u8; BUFFER_SIZE];
-
-                    while offset < end {
-                        let to_read = ((end - offset) as usize).min(BUFFER_SIZE);
-                        let buf = &mut buffer[..to_read];
-
-                        let mut total_read = 0;
-                        while total_read < to_read {
-                            let n = reader.read(&mut buf[total_read..]).await?;
-                            if n == 0 {
-                                break;
-                            }
-                            total_read += n;
-                        }
-
-                        if total_read == 0 {
-                            break;
-                        }
-
-                        let data = &mut buffer[..total_read];
-
-                        // Decrypt this portion with correct CTR counter
-                        let block_num = offset / 16;
-                        let mut file_iv = [0u8; 16];
-                        file_iv[..8].copy_from_slice(&aes_iv);
-                        // Set counter to block number (big endian)
-                        let counter_bytes = block_num.to_be_bytes();
-                        file_iv[8..].copy_from_slice(&counter_bytes);
-
-                        let mut ctr = ctr::Ctr128BE::<Aes128>::new(
-                            aes_key[..].into(),
-                            (&file_iv).into(),
-                        );
-                        ctr.apply_keystream(data);
-
-                        // Write to file at correct position
-                        {
-                            use std::io::{Seek, SeekFrom, Write};
-                            let mut f = file.lock().await;
-                            f.seek(SeekFrom::Start(offset))?;
-                            f.write_all(data)?;
-                        }
-
-                        // Update progress
-                        let total = bytes_downloaded.fetch_add(total_read as u64, Ordering::Relaxed) + total_read as u64;
-                        if let Some(ref cb) = progress {
-                            cb(total);
-                        }
-
-                        offset += total_read as u64;
-                    }
-
-                    Ok::<(), Error>(())
-                }
-            })
-            .collect();
-
-        let results = futures::future::join_all(download_futures).await;
-
-        // Check for errors
-        for result in results {
-            result?;
-        }
-
-        // TODO: Add MAC verification by reading the file back
-        // For now, trust that the download completed successfully
-
-        Ok(())
+        let (base_url, server_size) = self.get_download_url(node).await?;
+        parallel::download_parallel(&*self.client, node, base_url, server_size, writer, num_connections, progress).await
     }
 
     /// Uploads a file within a parent folder.
@@ -2560,7 +2488,7 @@ impl EventBatch {
 }
 
 /// Represents a node stored in MEGA (either a file or a folder).
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Node {
     /// The name of the node.
     pub(crate) name: String,
@@ -2679,6 +2607,7 @@ impl Node {
 }
 
 /// Represents a collection of nodes from MEGA.
+#[derive(Debug, Clone)]
 pub struct Nodes {
     /// The nodes from MEGA, keyed by their handle.
     pub(crate) nodes: HashMap<String, Node>,
@@ -2962,3 +2891,4 @@ pub struct UserInfo {
     /// The country code of the user.
     pub country_code: Option<String>,
 }
+

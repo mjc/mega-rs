@@ -285,6 +285,269 @@ pub async fn compute_condensed_mac<R: AsyncRead>(
     Ok(final_mac_data[..8].try_into().unwrap())
 }
 
+/// Pre-computed chunk boundary info for O(1) lookups
+#[cfg(feature = "parallel")]
+#[derive(Debug, Clone, Copy)]
+struct ChunkInfo {
+    start: u64,
+    size: u64,
+}
+
+/// A parallel MAC processor that computes MEGA chunk MACs independently.
+///
+/// Each MEGA chunk's MAC (`cur_mac`) can be computed independently - only the
+/// final combination step is sequential. This processor stores just the 16-byte
+/// MAC per MEGA chunk (~160KB for a 5GB file) instead of buffering actual data.
+///
+/// Uses sharded concurrent data structures (DashMap) for high-throughput
+/// parallel access with minimal lock contention.
+#[cfg(feature = "parallel")]
+pub struct ParallelMacProcessor {
+    aes_key: [u8; 16],
+    aes_iv_full: [u8; 16],
+    file_size: u64,
+
+    // Pre-computed chunk boundaries for O(1)/O(log n) lookups
+    chunk_boundaries: Box<[ChunkInfo]>,
+
+    // Computed MACs per MEGA chunk index (sharded concurrent map)
+    chunk_macs: dashmap::DashMap<usize, [u8; 16]>,
+
+    // Partial chunk state: (data buffer, bytes received)
+    chunk_state: dashmap::DashMap<usize, ChunkState>,
+}
+
+#[cfg(feature = "parallel")]
+struct ChunkState {
+    data: Vec<u8>,
+    bytes_received: usize,
+}
+
+#[cfg(feature = "parallel")]
+impl ParallelMacProcessor {
+    pub fn new(file_size: u64, aes_key: &[u8; 16], aes_iv: &[u8; 8]) -> Self {
+        let aes_iv_full = {
+            let mut iv = [0u8; 16];
+            iv[..8].copy_from_slice(aes_iv);
+            iv[8..].copy_from_slice(aes_iv);
+            iv
+        };
+
+        // Pre-compute all chunk boundaries
+        let chunk_boundaries = {
+            let mut boundaries = Vec::new();
+            let mut offset = 0u64;
+            let mut size = 131_072u64;
+            while offset < file_size {
+                let actual_size = size.min(file_size - offset);
+                boundaries.push(ChunkInfo { start: offset, size: actual_size });
+                offset += actual_size;
+                if size < 1_048_576 {
+                    size += 131_072;
+                }
+            }
+            boundaries.into_boxed_slice()
+        };
+
+        Self {
+            aes_key: *aes_key,
+            aes_iv_full,
+            file_size,
+            chunk_boundaries,
+            chunk_macs: dashmap::DashMap::new(),
+            chunk_state: dashmap::DashMap::new(),
+        }
+    }
+
+    /// Returns (mega_chunk_index, offset_within_chunk) for a file offset
+    /// Uses binary search for O(log n) lookup
+    fn mega_chunk_for_offset(&self, offset: u64) -> Option<(usize, u64)> {
+        // Out-of-bounds offsets are not valid and should not be processed
+        if offset >= self.file_size {
+            return None;
+        }
+
+        let idx = self.chunk_boundaries
+            .binary_search_by(|info| {
+                if offset < info.start {
+                    std::cmp::Ordering::Greater
+                } else if offset >= info.start + info.size {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .ok()?;
+
+        let chunk_start = self.chunk_boundaries[idx].start;
+        Some((idx, offset - chunk_start))
+    }
+
+    /// Returns the size of MEGA chunk at given index - O(1) lookup
+    fn mega_chunk_size(&self, idx: usize) -> u64 {
+        self.chunk_boundaries[idx].size
+    }
+
+    /// Returns the file offset where MEGA chunk starts - O(1) lookup
+    fn mega_chunk_start(&self, idx: usize) -> u64 {
+        self.chunk_boundaries[idx].start
+    }
+
+    /// Compute MAC for a complete MEGA chunk
+    fn compute_chunk_mac(&self, data: &[u8]) -> [u8; 16] {
+        compute_chunk_mac_inner(&self.aes_key, &self.aes_iv_full, data)
+    }
+}
+
+/// Standalone MAC computation for use with spawn_blocking
+#[cfg(feature = "parallel")]
+fn compute_chunk_mac_inner(aes_key: &[u8; 16], aes_iv: &[u8; 16], data: &[u8]) -> [u8; 16] {
+    let mut cur_mac = [0u8; 16];
+    let (blocks, leftover) = data.split_at(data.len() - data.len() % 16);
+
+    let mut mac = cbc::Encryptor::<Aes128>::new(aes_key.into(), aes_iv.into());
+    for block in blocks.chunks_exact(16) {
+        mac.encrypt_block_b2b_mut(block.into(), (&mut cur_mac).into());
+    }
+
+    if !leftover.is_empty() {
+        let mut padded = [0u8; 16];
+        padded[..leftover.len()].copy_from_slice(leftover);
+        mac.encrypt_block_b2b_mut((&padded).into(), (&mut cur_mac).into());
+    }
+
+    cur_mac
+}
+
+#[cfg(feature = "parallel")]
+impl ParallelMacProcessor {
+
+    /// Add data at the given file offset. Can be called from multiple threads.
+    pub fn add_chunk(&self, offset: u64, data: &[u8]) {
+        // Validate that the data range doesn't exceed file size
+        if let Some(end_offset) = offset.checked_add(data.len() as u64) {
+            debug_assert!(end_offset <= self.file_size,
+                "add_chunk: data range [{}, {}) exceeds file_size {}",
+                offset, end_offset, self.file_size);
+        } else {
+            debug_assert!(false, "add_chunk: offset overflow");
+        }
+
+        // Delegate to compute_macs_for_data which handles all the chunk iteration and buffering logic
+        let _ = self.compute_macs_for_data(offset, data);
+    }
+
+    /// Compute MACs for data and store them. Returns count of complete chunks processed.
+    /// Handles both complete chunks (computed directly) and partial chunks (buffered).
+    /// Can be called from multiple threads concurrently.
+    pub fn compute_macs_for_data(&self, offset: u64, data: &[u8]) -> usize {
+        let mut complete_count = 0;
+        let mut pos = offset;
+        let mut remaining = data;
+
+        while !remaining.is_empty() {
+            let (chunk_idx, offset_in_chunk) = match self.mega_chunk_for_offset(pos) {
+                Some(result) => result,
+                None => break, // Offset is out of bounds, stop processing
+            };
+            let chunk_size = self.mega_chunk_size(chunk_idx);
+            let chunk_start = self.mega_chunk_start(chunk_idx);
+            let chunk_end = (chunk_start + chunk_size).min(self.file_size);
+            let actual_chunk_size = (chunk_end - chunk_start) as usize;
+
+            let bytes_until_chunk_end = (chunk_end - pos) as usize;
+            let to_take = remaining.len().min(bytes_until_chunk_end);
+            let (for_this_chunk, rest) = remaining.split_at(to_take);
+
+            // Fast path: complete, aligned chunk - compute MAC directly
+            if offset_in_chunk == 0 && to_take == actual_chunk_size {
+                // Use vacant_entry to atomically check and insert, avoiding redundant
+                // computation and ensuring complete_count is only incremented on actual inserts
+                if let dashmap::mapref::entry::Entry::Vacant(entry) = self.chunk_macs.entry(chunk_idx) {
+                    let mac = self.compute_chunk_mac(for_this_chunk);
+                    entry.insert(mac);
+                    complete_count += 1;
+                }
+            } else {
+                // Slow path: partial chunk at boundary - use buffering
+                // buffer_partial_chunk checks chunk_macs internally to skip already-completed chunks
+                self.buffer_partial_chunk(chunk_idx, offset_in_chunk as usize, for_this_chunk, actual_chunk_size);
+            }
+
+            pos += to_take as u64;
+            remaining = rest;
+        }
+
+        complete_count
+    }
+
+    /// Buffer partial chunk data, computing MAC when complete.
+    /// Safe to call concurrently: skips chunks whose MAC was already computed.
+    fn buffer_partial_chunk(&self, chunk_idx: usize, offset_in_chunk: usize, data: &[u8], actual_chunk_size: usize) {
+        // Skip if another thread already completed this chunk's MAC
+        if self.chunk_macs.contains_key(&chunk_idx) {
+            return;
+        }
+
+        let mut completed_data = None;
+
+        self.chunk_state
+            .entry(chunk_idx)
+            .and_modify(|state| {
+                state.data[offset_in_chunk..offset_in_chunk + data.len()].copy_from_slice(data);
+                state.bytes_received += data.len();
+
+                if state.bytes_received == actual_chunk_size {
+                    completed_data = Some(std::mem::take(&mut state.data));
+                }
+            })
+            .or_insert_with(|| {
+                let mut buf = vec![0u8; actual_chunk_size];
+                buf[offset_in_chunk..offset_in_chunk + data.len()].copy_from_slice(data);
+
+                ChunkState {
+                    data: buf,
+                    bytes_received: data.len(),
+                }
+            });
+
+        // If chunk is complete, compute MAC and clean up
+        if let Some(data) = completed_data {
+            let mac = self.compute_chunk_mac(&data);
+            self.chunk_macs.insert(chunk_idx, mac);
+            self.chunk_state.remove(&chunk_idx);
+        }
+    }
+
+    /// Finalize and return the combined MAC
+    pub fn finalize(&self) -> Option<[u8; 8]> {
+        let num_chunks = self.chunk_boundaries.len();
+
+        // Verify we have all chunks
+        if self.chunk_macs.len() != num_chunks {
+            return None;
+        }
+
+        // Combine MACs in order
+        let mut final_mac_data = [0u8; 16];
+        let mut final_mac = cbc::Encryptor::<Aes128>::new((&self.aes_key).into(), (&final_mac_data).into());
+
+        for idx in 0..num_chunks {
+            let cur_mac = self.chunk_macs.get(&idx)?;
+            final_mac.encrypt_block_b2b_mut(cur_mac.value().into(), (&mut final_mac_data).into());
+        }
+
+        // XOR to produce final 8-byte MAC
+        for i in 0..4 {
+            final_mac_data[i] ^= final_mac_data[i + 4];
+            final_mac_data[i + 4] = final_mac_data[i + 8] ^ final_mac_data[i + 12];
+        }
+
+        Some(final_mac_data[..8].try_into().unwrap())
+    }
+}
+
+
 /// Computes a condensed MAC from an in-memory buffer.
 ///
 /// This is useful when the entire file content is already in memory (e.g., after
@@ -308,7 +571,21 @@ pub fn compute_condensed_mac_from_buffer(
         iv
     };
 
-    let total_size = size as usize;
+    let total_size = usize::try_from(size).map_err(|_| {
+        crate::Error::from(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "size parameter overflows usize",
+        ))
+    })?;
+
+    // Validate that size doesn't exceed data buffer
+    if total_size > data.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("size {} exceeds data buffer length {}", total_size, data.len()),
+        ).into());
+    }
+
     let mut offset = 0;
 
     while offset < total_size {
@@ -342,4 +619,342 @@ pub fn compute_condensed_mac_from_buffer(
     }
 
     Ok(final_mac_data[..8].try_into().unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEST_KEY: [u8; 16] = [
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+        0x0f,
+    ];
+    const TEST_IV: [u8; 8] = [0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17];
+
+    #[tokio::test]
+    async fn condensed_mac_buffer_matches_stream() {
+        // Test that compute_condensed_mac_from_buffer produces same result as compute_condensed_mac
+        let data: Vec<u8> = (0..10000).map(|i| (i % 256) as u8).collect();
+        let size = data.len() as u64;
+
+        let stream_mac = {
+            let cursor = futures::io::Cursor::new(&data);
+            compute_condensed_mac(cursor, size, &TEST_KEY, &TEST_IV)
+                .await
+                .unwrap()
+        };
+
+        let buffer_mac =
+            compute_condensed_mac_from_buffer(&data, size, &TEST_KEY, &TEST_IV).unwrap();
+
+        assert_eq!(stream_mac, buffer_mac);
+    }
+
+    #[tokio::test]
+    async fn condensed_mac_buffer_matches_stream_large() {
+        // Test with larger data that spans multiple MEGA chunks (>128KB)
+        let data: Vec<u8> = (0..500_000).map(|i| (i % 256) as u8).collect();
+        let size = data.len() as u64;
+
+        let stream_mac = {
+            let cursor = futures::io::Cursor::new(&data);
+            compute_condensed_mac(cursor, size, &TEST_KEY, &TEST_IV)
+                .await
+                .unwrap()
+        };
+
+        let buffer_mac =
+            compute_condensed_mac_from_buffer(&data, size, &TEST_KEY, &TEST_IV).unwrap();
+
+        assert_eq!(stream_mac, buffer_mac);
+    }
+
+    #[tokio::test]
+    async fn condensed_mac_empty_data() {
+        let data: Vec<u8> = vec![];
+        let size = 0u64;
+
+        let stream_mac = {
+            let cursor = futures::io::Cursor::new(&data);
+            compute_condensed_mac(cursor, size, &TEST_KEY, &TEST_IV)
+                .await
+                .unwrap()
+        };
+
+        let buffer_mac =
+            compute_condensed_mac_from_buffer(&data, size, &TEST_KEY, &TEST_IV).unwrap();
+
+        assert_eq!(stream_mac, buffer_mac);
+    }
+
+    #[tokio::test]
+    async fn condensed_mac_single_chunk() {
+        // Test with data smaller than one MEGA chunk (128KB)
+        let data: Vec<u8> = (0..50_000).map(|i| (i % 256) as u8).collect();
+        let size = data.len() as u64;
+
+        let stream_mac = {
+            let cursor = futures::io::Cursor::new(&data);
+            compute_condensed_mac(cursor, size, &TEST_KEY, &TEST_IV)
+                .await
+                .unwrap()
+        };
+
+        let buffer_mac =
+            compute_condensed_mac_from_buffer(&data, size, &TEST_KEY, &TEST_IV).unwrap();
+
+        assert_eq!(stream_mac, buffer_mac);
+    }
+
+    #[tokio::test]
+    async fn condensed_mac_exactly_one_chunk() {
+        // Test with data exactly one MEGA chunk (128KB = 131072 bytes)
+        let data: Vec<u8> = (0..131_072).map(|i| (i % 256) as u8).collect();
+        let size = data.len() as u64;
+
+        let stream_mac = {
+            let cursor = futures::io::Cursor::new(&data);
+            compute_condensed_mac(cursor, size, &TEST_KEY, &TEST_IV)
+                .await
+                .unwrap()
+        };
+
+        let buffer_mac =
+            compute_condensed_mac_from_buffer(&data, size, &TEST_KEY, &TEST_IV).unwrap();
+
+        assert_eq!(stream_mac, buffer_mac);
+    }
+
+    #[tokio::test]
+    async fn condensed_mac_unaligned_size() {
+        // Test with data size not aligned to 16 bytes
+        let data: Vec<u8> = (0..10007).map(|i| (i % 256) as u8).collect();
+        let size = data.len() as u64;
+
+        let stream_mac = {
+            let cursor = futures::io::Cursor::new(&data);
+            compute_condensed_mac(cursor, size, &TEST_KEY, &TEST_IV)
+                .await
+                .unwrap()
+        };
+
+        let buffer_mac =
+            compute_condensed_mac_from_buffer(&data, size, &TEST_KEY, &TEST_IV).unwrap();
+
+        assert_eq!(stream_mac, buffer_mac);
+    }
+
+    #[tokio::test]
+    async fn sparse_checksum_small_file() {
+        // Files 17-8192 bytes: full CRC32 coverage
+        let data: Vec<u8> = (0..1000).map(|i| (i % 256) as u8).collect();
+        let cursor = futures::io::Cursor::new(&data);
+        let checksum = compute_sparse_checksum(cursor, data.len() as u64)
+            .await
+            .unwrap();
+
+        // Verify it's not all zeros
+        assert_ne!(checksum, [0u8; 16]);
+    }
+
+    #[tokio::test]
+    async fn sparse_checksum_deterministic() {
+        let data: Vec<u8> = (0..5000).map(|i| (i % 256) as u8).collect();
+
+        let checksum1 = {
+            let cursor = futures::io::Cursor::new(&data);
+            compute_sparse_checksum(cursor, data.len() as u64)
+                .await
+                .unwrap()
+        };
+
+        let checksum2 = {
+            let cursor = futures::io::Cursor::new(&data);
+            compute_sparse_checksum(cursor, data.len() as u64)
+                .await
+                .unwrap()
+        };
+
+        assert_eq!(checksum1, checksum2);
+    }
+
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn parallel_mac_matches_buffer_in_order() {
+        // Test ParallelMacProcessor with chunks arriving in order
+        let data: Vec<u8> = (0..500_000).map(|i| (i % 256) as u8).collect();
+        let size = data.len() as u64;
+
+        let buffer_mac =
+            compute_condensed_mac_from_buffer(&data, size, &TEST_KEY, &TEST_IV).unwrap();
+
+        let processor = ParallelMacProcessor::new(size, &TEST_KEY, &TEST_IV);
+        let chunk_size = 100_000usize;
+        let mut offset = 0u64;
+        while offset < size {
+            let end = (offset + chunk_size as u64).min(size);
+            processor.add_chunk(offset, &data[offset as usize..end as usize]);
+            offset = end;
+        }
+
+        let parallel_mac = processor.finalize().unwrap();
+        assert_eq!(parallel_mac, buffer_mac);
+    }
+
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn parallel_mac_matches_buffer_out_of_order() {
+        // Test ParallelMacProcessor with chunks arriving out of order
+        let data: Vec<u8> = (0..500_000).map(|i| (i % 256) as u8).collect();
+        let size = data.len() as u64;
+
+        let buffer_mac =
+            compute_condensed_mac_from_buffer(&data, size, &TEST_KEY, &TEST_IV).unwrap();
+
+        // Split into chunk ranges and deliver out of order
+        let chunk_size = 100_000usize;
+        let chunk_ranges: Vec<(u64, usize, usize)> = (0..)
+            .map(|i| {
+                let start = i * chunk_size;
+                let end = ((i + 1) * chunk_size).min(data.len());
+                (start as u64, start, end)
+            })
+            .take_while(|(_, start, end)| start < end)
+            .collect();
+
+        // Deliver in reverse order
+        let processor = ParallelMacProcessor::new(size, &TEST_KEY, &TEST_IV);
+        for (offset, start, end) in chunk_ranges.into_iter().rev() {
+            processor.add_chunk(offset, &data[start..end]);
+        }
+
+        let parallel_mac = processor.finalize().unwrap();
+        assert_eq!(parallel_mac, buffer_mac);
+    }
+
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn parallel_mac_matches_buffer_large_file() {
+        // Test with data spanning multiple MEGA chunk sizes (128KB -> 1MB)
+        let data: Vec<u8> = (0..3_000_000).map(|i| (i % 256) as u8).collect();
+        let size = data.len() as u64;
+
+        let buffer_mac =
+            compute_condensed_mac_from_buffer(&data, size, &TEST_KEY, &TEST_IV).unwrap();
+
+        // Split data into chunk ranges
+        let chunk_size = 500_000usize;
+        let chunk_ranges: Vec<(u64, usize, usize)> = (0..)
+            .map(|i| {
+                let start = i * chunk_size;
+                let end = ((i + 1) * chunk_size).min(data.len());
+                (start as u64, start, end)
+            })
+            .take_while(|(_, start, end)| start < end)
+            .collect();
+
+        // Deliver even-indexed chunks first, then odd-indexed
+        let processor = ParallelMacProcessor::new(size, &TEST_KEY, &TEST_IV);
+        for (i, &(offset, start, end)) in chunk_ranges.iter().enumerate() {
+            if i % 2 == 0 {
+                processor.add_chunk(offset, &data[start..end]);
+            }
+        }
+        for (i, &(offset, start, end)) in chunk_ranges.iter().enumerate() {
+            if i % 2 == 1 {
+                processor.add_chunk(offset, &data[start..end]);
+            }
+        }
+
+        let parallel_mac = processor.finalize().unwrap();
+        assert_eq!(parallel_mac, buffer_mac);
+    }
+
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn compute_macs_for_data_unaligned_boundaries() {
+        // Test compute_macs_for_data when download chunks don't align with MEGA chunk boundaries.
+        // This is the bug that caused CondensedMacMismatch: MEGA chunks are 128KB->1MB,
+        // but download chunks are fixed size (e.g., 128MB), so boundaries don't align.
+        //
+        // Example: MEGA chunks at 0, 128KB, 384KB, ..., 4.5MB, 5.5MB, 6.5MB, ...
+        // Download chunk at 5MB would split the MEGA chunk from 4.5MB-5.5MB.
+
+        // Create ~6MB of data to span the variable-size MEGA chunk region
+        let data: Vec<u8> = (0..6_000_000).map(|i| (i % 256) as u8).collect();
+        let size = data.len() as u64;
+
+        let expected_mac =
+            compute_condensed_mac_from_buffer(&data, size, &TEST_KEY, &TEST_IV).unwrap();
+
+        let processor = ParallelMacProcessor::new(size, &TEST_KEY, &TEST_IV);
+
+        // Simulate download chunks that DON'T align with MEGA chunk boundaries.
+        // Use 1.5MB chunks - this will definitely split some 1MB MEGA chunks.
+        let download_chunk_size = 1_500_000usize;
+        let mut offset = 0u64;
+        while offset < size {
+            let end = (offset as usize + download_chunk_size).min(data.len());
+            let chunk_data = &data[offset as usize..end];
+
+            // In parallel.rs the downloader calls ParallelMacProcessor::add_chunk, which
+            // relies on this logic. Here we call compute_macs_for_data directly to ensure
+            // partial MEGA chunks at the boundaries are handled correctly.
+            processor.compute_macs_for_data(offset, chunk_data);
+
+            offset = end as u64;
+        }
+
+        let computed_mac = processor.finalize().unwrap();
+        assert_eq!(
+            computed_mac, expected_mac,
+            "MAC mismatch with unaligned download chunks"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn compute_macs_for_data_parallel_simulation() {
+        // Simulate parallel workers with interleaved chunk processing.
+        // Worker 0 gets chunks 0, 2, 4, ... and Worker 1 gets chunks 1, 3, 5, ...
+        // This tests concurrent access to the DashMap and partial chunk buffering.
+
+        let data: Vec<u8> = (0..10_000_000).map(|i| (i % 256) as u8).collect();
+        let size = data.len() as u64;
+
+        let expected_mac =
+            compute_condensed_mac_from_buffer(&data, size, &TEST_KEY, &TEST_IV).unwrap();
+
+        let processor = ParallelMacProcessor::new(size, &TEST_KEY, &TEST_IV);
+
+        // Use 2MB download chunks, delivered out of order (simulating 2 workers)
+        let download_chunk_size = 2_000_000usize;
+        let chunks: Vec<(u64, usize, usize)> = (0..)
+            .map(|i| {
+                let start = i * download_chunk_size;
+                let end = ((i + 1) * download_chunk_size).min(data.len());
+                (start as u64, start, end)
+            })
+            .take_while(|(_, start, end)| start < end)
+            .collect();
+
+        // Worker 0: even chunks first
+        for (i, &(offset, start, end)) in chunks.iter().enumerate() {
+            if i % 2 == 0 {
+                processor.compute_macs_for_data(offset, &data[start..end]);
+            }
+        }
+        // Worker 1: odd chunks
+        for (i, &(offset, start, end)) in chunks.iter().enumerate() {
+            if i % 2 == 1 {
+                processor.compute_macs_for_data(offset, &data[start..end]);
+            }
+        }
+
+        let computed_mac = processor.finalize().unwrap();
+        assert_eq!(
+            computed_mac, expected_mac,
+            "MAC mismatch with parallel worker simulation"
+        );
+    }
 }
