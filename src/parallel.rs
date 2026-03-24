@@ -110,7 +110,17 @@ async fn download_worker(client: &dyn HttpClient, ctx: DownloadContext) -> Resul
 
         while bytes_read < range.length as usize {
             match response.read(&mut buffer[bytes_read..]).await? {
-                0 => break,
+                0 => {
+                    // EOF before reaching expected bytes
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "unexpected EOF while reading HTTP chunk: expected {} bytes, got {} bytes",
+                            range.length, bytes_read
+                        ),
+                    )
+                    .into());
+                }
                 n => {
                     bytes_read += n;
                     if let Some(ref total) = ctx.progress_total {
@@ -128,17 +138,6 @@ async fn download_worker(client: &dyn HttpClient, ctx: DownloadContext) -> Resul
                     }
                 }
             }
-        }
-
-        if bytes_read < range.length as usize {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                format!(
-                    "incomplete chunk download: expected {} bytes, got {} bytes",
-                    range.length, bytes_read
-                ),
-            )
-            .into());
         }
 
         buffer.truncate(bytes_read);
