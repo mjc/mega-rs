@@ -310,9 +310,10 @@ pub struct ParallelMacProcessor {
     chunk_boundaries: Box<[ChunkInfo]>,
 
     // Computed MACs per MEGA chunk: each MAC is 16 bytes stored as two u64 atomics
-    // Use u64::MAX as sentinel for "not computed yet"
     chunk_macs_lo: Box<[std::sync::atomic::AtomicU64]>,
     chunk_macs_hi: Box<[std::sync::atomic::AtomicU64]>,
+    // Separate computed flag to avoid false negatives from valid MAC values that equal u64::MAX
+    chunk_macs_computed: Box<[std::sync::atomic::AtomicBool]>,
 
     // Partial chunk state: (data buffer, bytes received)
     chunk_state: std::sync::Mutex<Vec<Option<ChunkState>>>,
@@ -360,10 +361,13 @@ impl ParallelMacProcessor {
             file_size,
             chunk_boundaries,
             chunk_macs_lo: (0..num_chunks)
-                .map(|_| std::sync::atomic::AtomicU64::new(u64::MAX))
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
                 .collect(),
             chunk_macs_hi: (0..num_chunks)
-                .map(|_| std::sync::atomic::AtomicU64::new(u64::MAX))
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
+            chunk_macs_computed: (0..num_chunks)
+                .map(|_| std::sync::atomic::AtomicBool::new(false))
                 .collect(),
             chunk_state: std::sync::Mutex::new((0..num_chunks).map(|_| None).collect()),
         }
@@ -410,21 +414,25 @@ impl ParallelMacProcessor {
     }
 
     /// Store a MAC atomically (16 bytes as two u64s)
-    /// Writes hi first, then lo (Release) so readers never see a torn/invalid MAC.
+    /// Stores MAC values first (Relaxed), then sets the computed flag (Release) so readers
+    /// see a complete, valid MAC when they observe the flag.
     fn store_mac(&self, idx: usize, mac: [u8; 16]) {
         let lo = u64::from_le_bytes(mac[0..8].try_into().unwrap());
         let hi = u64::from_le_bytes(mac[8..16].try_into().unwrap());
         self.chunk_macs_hi[idx].store(hi, std::sync::atomic::Ordering::Relaxed);
-        self.chunk_macs_lo[idx].store(lo, std::sync::atomic::Ordering::Release);
+        self.chunk_macs_lo[idx].store(lo, std::sync::atomic::Ordering::Relaxed);
+        // Publish the MAC by setting the computed flag with Release ordering
+        self.chunk_macs_computed[idx].store(true, std::sync::atomic::Ordering::Release);
     }
 
-    /// Load a MAC atomically, returning None if not yet computed (sentinel is u64::MAX)
+    /// Load a MAC atomically, returning None if not yet computed
     fn load_mac(&self, idx: usize) -> Option<[u8; 16]> {
-        let lo = self.chunk_macs_lo[idx].load(std::sync::atomic::Ordering::Acquire);
-        if lo == u64::MAX {
+        // Check the computed flag first with Acquire ordering
+        if !self.chunk_macs_computed[idx].load(std::sync::atomic::Ordering::Acquire) {
             return None;
         }
-        let hi = self.chunk_macs_hi[idx].load(std::sync::atomic::Ordering::Acquire);
+        let lo = self.chunk_macs_lo[idx].load(std::sync::atomic::Ordering::Relaxed);
+        let hi = self.chunk_macs_hi[idx].load(std::sync::atomic::Ordering::Relaxed);
         let mut mac = [0u8; 16];
         mac[0..8].copy_from_slice(&lo.to_le_bytes());
         mac[8..16].copy_from_slice(&hi.to_le_bytes());
@@ -433,7 +441,7 @@ impl ParallelMacProcessor {
 
     /// Check if a MAC has been computed (without loading it)
     fn is_mac_computed(&self, idx: usize) -> bool {
-        self.chunk_macs_lo[idx].load(std::sync::atomic::Ordering::Acquire) != u64::MAX
+        self.chunk_macs_computed[idx].load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -543,34 +551,42 @@ impl ParallelMacProcessor {
         let mut completed_data = None;
 
         {
-            let mut states = self.chunk_state.lock().unwrap();
+            let mut states = self.chunk_state.lock().expect("chunk_state mutex poisoned");
             if let Some(state) = &mut states[chunk_idx] {
+                // Skip if another thread is already finalizing this chunk
+                if state.bytes_received == actual_chunk_size {
+                    return;
+                }
                 state.data[offset_in_chunk..offset_in_chunk + data.len()].copy_from_slice(data);
                 state.bytes_received += data.len();
 
                 if state.bytes_received == actual_chunk_size {
-                    // Clone the completed buffer instead of taking it, so we can atomically
-                    // remove the entry in the same lock scope before returning.
+                    // Clone the completed buffer. Keep state in place until after MAC is stored
+                    // to prevent another thread from allocating a new state in the None case.
                     completed_data = Some(state.data.clone());
-                    // Remove the state entry immediately to prevent race: concurrent write
-                    // won't see the now-empty Vec and panic.
-                    states[chunk_idx] = None;
                 }
             } else {
-                let mut buf = vec![0u8; actual_chunk_size];
-                buf[offset_in_chunk..offset_in_chunk + data.len()].copy_from_slice(data);
+                // Only allocate a new state if the MAC hasn't already been computed.
+                // This guards against the race window where another thread is finalizing.
+                if !self.is_mac_computed(chunk_idx) {
+                    let mut buf = vec![0u8; actual_chunk_size];
+                    buf[offset_in_chunk..offset_in_chunk + data.len()].copy_from_slice(data);
 
-                states[chunk_idx] = Some(ChunkState {
-                    data: buf,
-                    bytes_received: data.len(),
-                });
+                    states[chunk_idx] = Some(ChunkState {
+                        data: buf,
+                        bytes_received: data.len(),
+                    });
+                }
             }
         }
 
-        // If chunk is complete, compute MAC (outside the lock)
+        // If chunk is complete, compute MAC and store it (outside the lock)
         if let Some(data) = completed_data {
             let mac = self.compute_chunk_mac(&data);
             self.store_mac(chunk_idx, mac);
+
+            // Now that MAC is stored, clear the state to free memory
+            self.chunk_state.lock().expect("chunk_state mutex poisoned")[chunk_idx] = None;
         }
     }
 
