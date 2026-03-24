@@ -104,7 +104,9 @@ async fn download_worker(client: &dyn HttpClient, ctx: DownloadContext) -> Resul
         let range = ChunkRange::new(idx, ctx.file_size);
         let target_size = range.length as usize;
         buffer.clear();
-        buffer.resize(target_size, 0);
+        // SAFETY: We will fill all bytes via the read loop below. The EOF check at line 115
+        // ensures we read exactly target_size bytes before using the buffer downstream.
+        unsafe { buffer.set_len(target_size) };
 
         let url = range.url(&ctx.base_url).parse()?;
         let mut response = client.get(url).await?;
