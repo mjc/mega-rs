@@ -429,37 +429,6 @@ impl ParallelMacProcessor {
         Some((idx, offset - chunk_start))
     }
 
-    /// Returns the size of MEGA chunk at given index - O(1) lookup
-    fn mega_chunk_size(&self, idx: usize) -> u64 {
-        self.chunk_boundaries[idx].size
-    }
-
-    /// Returns the file offset where MEGA chunk starts - O(1) lookup
-    fn mega_chunk_start(&self, idx: usize) -> u64 {
-        self.chunk_boundaries[idx].start
-    }
-
-    /// Compute MAC for a complete MEGA chunk
-    fn compute_chunk_mac(&self, data: &[u8]) -> [u8; 16] {
-        compute_chunk_mac_inner(&self.aes_key, &self.aes_iv_full, data)
-    }
-
-    /// Store a MAC atomically (16 bytes as two u64s)
-    /// Stores MAC values first (Relaxed), then sets the computed flag (Release) so readers
-    /// see a complete, valid MAC when they observe the flag.
-    fn store_mac(&self, idx: usize, mac: [u8; 16]) {
-        self.chunk_macs[idx].store(mac);
-    }
-
-    /// Load a MAC atomically, returning None if not yet computed
-    fn load_mac(&self, idx: usize) -> Option<[u8; 16]> {
-        self.chunk_macs[idx].load()
-    }
-
-    /// Check if a MAC has been computed (without loading it)
-    fn is_mac_computed(&self, idx: usize) -> bool {
-        self.chunk_macs[idx].is_computed()
-    }
 }
 
 /// Standalone MAC computation for use with spawn_blocking
@@ -485,6 +454,11 @@ fn compute_chunk_mac_inner(aes_key: &[u8; 16], aes_iv: &[u8; 16], data: &[u8]) -
 #[cfg(feature = "parallel")]
 impl ParallelMacProcessor {
     /// Add data at the given file offset. Can be called from multiple threads.
+    ///
+    /// Processes data linearly through MEGA chunks:
+    /// - One initial binary search to find the starting chunk
+    /// - Then linear iteration through successive chunks (no per-iteration searches)
+    /// - Complete chunks compute MACs directly; partial chunks are buffered
     pub fn add_chunk(&self, offset: u64, data: &[u8]) {
         // Validate that the data range doesn't exceed file size
         if let Some(end_offset) = offset.checked_add(data.len() as u64) {
@@ -499,56 +473,40 @@ impl ParallelMacProcessor {
             debug_assert!(false, "add_chunk: offset overflow");
         }
 
-        // Delegate to compute_macs_for_data which handles all the chunk iteration and buffering logic
-        let _ = self.compute_macs_for_data(offset, data);
-    }
+        // One binary search to find the starting MEGA chunk
+        let Some((mut chunk_idx, _)) = self.mega_chunk_for_offset(offset) else { return };
 
-    /// Compute MACs for data and store them. Returns count of complete chunks processed.
-    /// Handles both complete chunks (computed directly) and partial chunks (buffered).
-    /// Can be called from multiple threads concurrently.
-    pub fn compute_macs_for_data(&self, offset: u64, data: &[u8]) -> usize {
-        let mut complete_count = 0;
         let mut pos = offset;
         let mut remaining = data;
 
-        while !remaining.is_empty() {
-            let (chunk_idx, offset_in_chunk) = match self.mega_chunk_for_offset(pos) {
-                Some(result) => result,
-                None => break, // Offset is out of bounds, stop processing
-            };
-            let chunk_size = self.mega_chunk_size(chunk_idx);
-            let chunk_start = self.mega_chunk_start(chunk_idx);
-            let chunk_end = (chunk_start + chunk_size).min(self.file_size);
-            let actual_chunk_size = (chunk_end - chunk_start) as usize;
-
-            let bytes_until_chunk_end = (chunk_end - pos) as usize;
-            let to_take = remaining.len().min(bytes_until_chunk_end);
+        while !remaining.is_empty() && chunk_idx < self.chunk_boundaries.len() {
+            let info = self.chunk_boundaries[chunk_idx];
+            let chunk_end = info.start + info.size;
+            let offset_in_chunk = (pos - info.start) as usize;
+            let bytes_until_end = (chunk_end - pos) as usize;
+            let to_take = remaining.len().min(bytes_until_end);
             let (for_this_chunk, rest) = remaining.split_at(to_take);
 
             // Fast path: complete, aligned chunk - compute MAC directly
-            if offset_in_chunk == 0 && to_take == actual_chunk_size {
-                // Check if already computed; only increment on actual compute
-                if !self.is_mac_computed(chunk_idx) {
-                    let mac = self.compute_chunk_mac(for_this_chunk);
-                    self.store_mac(chunk_idx, mac);
-                    complete_count += 1;
+            if offset_in_chunk == 0 && to_take == info.size as usize {
+                if !self.chunk_macs[chunk_idx].is_computed() {
+                    let mac = compute_chunk_mac_inner(&self.aes_key, &self.aes_iv_full, for_this_chunk);
+                    self.chunk_macs[chunk_idx].store(mac);
                 }
             } else {
                 // Slow path: partial chunk at boundary - use buffering
-                // buffer_partial_chunk checks chunk_macs internally to skip already-completed chunks
                 self.buffer_partial_chunk(
                     chunk_idx,
-                    offset_in_chunk as usize,
+                    offset_in_chunk,
                     for_this_chunk,
-                    actual_chunk_size,
+                    info.size as usize,
                 );
             }
 
             pos += to_take as u64;
             remaining = rest;
+            chunk_idx += 1;  // Linear advance — no per-iteration binary search
         }
-
-        complete_count
     }
 
     /// Buffer partial chunk data, computing MAC when complete.
@@ -561,7 +519,7 @@ impl ParallelMacProcessor {
         actual_chunk_size: usize,
     ) {
         // Skip if another thread already completed this chunk's MAC
-        if self.is_mac_computed(chunk_idx) {
+        if self.chunk_macs[chunk_idx].is_computed() {
             return;
         }
 
@@ -585,7 +543,7 @@ impl ParallelMacProcessor {
             } else {
                 // Only allocate a new state if the MAC hasn't already been computed.
                 // This guards against the race window where another thread is finalizing.
-                if !self.is_mac_computed(chunk_idx) {
+                if !self.chunk_macs[chunk_idx].is_computed() {
                     let mut buf = vec![0u8; actual_chunk_size];
                     buf[offset_in_chunk..offset_in_chunk + data.len()].copy_from_slice(data);
 
@@ -599,8 +557,8 @@ impl ParallelMacProcessor {
 
         // If chunk is complete, compute MAC and store it (outside the lock)
         if let Some(data) = completed_data {
-            let mac = self.compute_chunk_mac(&data);
-            self.store_mac(chunk_idx, mac);
+            let mac = compute_chunk_mac_inner(&self.aes_key, &self.aes_iv_full, &data);
+            self.chunk_macs[chunk_idx].store(mac);
 
             // Now that MAC is stored, clear the state to free memory
             self.chunk_state.lock().expect("chunk_state mutex poisoned")[chunk_idx] = None;
@@ -613,7 +571,7 @@ impl ParallelMacProcessor {
 
         // Verify we have all chunks
         for idx in 0..num_chunks {
-            if !self.is_mac_computed(idx) {
+            if !self.chunk_macs[idx].is_computed() {
                 return None;
             }
         }
@@ -624,7 +582,7 @@ impl ParallelMacProcessor {
             cbc::Encryptor::<Aes128>::new((&self.aes_key).into(), (&final_mac_data).into());
 
         for idx in 0..num_chunks {
-            let cur_mac = self.load_mac(idx)?;
+            let cur_mac = self.chunk_macs[idx].load()?;
             final_mac.encrypt_block_b2b_mut((&cur_mac).into(), (&mut final_mac_data).into());
         }
 
@@ -983,8 +941,8 @@ mod tests {
 
     #[test]
     #[cfg(feature = "parallel")]
-    fn compute_macs_for_data_unaligned_boundaries() {
-        // Test compute_macs_for_data when download chunks don't align with MEGA chunk boundaries.
+    fn add_chunk_unaligned_boundaries() {
+        // Test add_chunk when download chunks don't align with MEGA chunk boundaries.
         // This is the bug that caused CondensedMacMismatch: MEGA chunks are 128KB->1MB,
         // but download chunks are fixed size (e.g., 128MB), so boundaries don't align.
         //
@@ -1008,10 +966,8 @@ mod tests {
             let end = (offset as usize + download_chunk_size).min(data.len());
             let chunk_data = &data[offset as usize..end];
 
-            // In parallel.rs the downloader calls ParallelMacProcessor::add_chunk, which
-            // relies on this logic. Here we call compute_macs_for_data directly to ensure
-            // partial MEGA chunks at the boundaries are handled correctly.
-            processor.compute_macs_for_data(offset, chunk_data);
+            // Test the new add_chunk method with unaligned boundaries
+            processor.add_chunk(offset, chunk_data);
 
             offset = end as u64;
         }
@@ -1025,7 +981,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "parallel")]
-    fn compute_macs_for_data_parallel_simulation() {
+    fn add_chunk_parallel_simulation() {
         // Simulate parallel workers with interleaved chunk processing.
         // Worker 0 gets chunks 0, 2, 4, ... and Worker 1 gets chunks 1, 3, 5, ...
         // This tests concurrent access to ParallelMacProcessor and partial chunk buffering.
@@ -1052,13 +1008,13 @@ mod tests {
         // Worker 0: even chunks first
         for (i, &(offset, start, end)) in chunks.iter().enumerate() {
             if i % 2 == 0 {
-                processor.compute_macs_for_data(offset, &data[start..end]);
+                processor.add_chunk(offset, &data[start..end]);
             }
         }
         // Worker 1: odd chunks
         for (i, &(offset, start, end)) in chunks.iter().enumerate() {
             if i % 2 == 1 {
-                processor.compute_macs_for_data(offset, &data[start..end]);
+                processor.add_chunk(offset, &data[start..end]);
             }
         }
 
