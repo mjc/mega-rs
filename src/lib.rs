@@ -1301,13 +1301,14 @@ impl Client {
     ///
     /// This method is optimized for larger files where bandwidth efficiency matters.
     /// It downloads file chunks in parallel while maintaining the integrity of the file
-    /// through streaming MAC verification, avoiding full buffering of the decrypted data.
+    /// through concurrent MAC verification, bounded to memory usage of ~(num_workers × 32MB).
     ///
     /// **Architecture:**
     /// - Multiple download workers fetch 32MB chunks concurrently from the server
-    /// - A single processor task decrypts chunks in-place and writes them to the output writer
-    /// - MAC verification uses sharded concurrent data structures to store only 16-byte MACs
-    ///   per MEGA chunk, keeping memory usage bounded even for very large files
+    /// - Downloaded chunks are buffered in-flight but immediately decrypted and written as available
+    /// - A single processor task handles decryption, file writing, and MAC computation
+    /// - MAC verification uses concurrent data structures to store only 16-byte MACs per MEGA chunk
+    /// - Out-of-order chunks are handled transparently; final integrity check uses condensed MAC
     ///
     /// # Arguments
     /// * `node` - The node to download
@@ -1337,6 +1338,7 @@ impl Client {
     /// * `writer` - An async writer that supports seeking (e.g., any `futures::io::AsyncWrite + AsyncSeek`)
     /// * `num_connections` - Number of parallel download workers (recommended: 4-8 for optimal throughput)
     /// * `progress` - Optional callback invoked with the cumulative number of bytes downloaded so far
+    ///   (reports are monotonically increasing and may skip values due to concurrent worker ordering)
     #[cfg(feature = "parallel")]
     pub async fn download_node_parallel_with_progress<W, F>(
         &self,

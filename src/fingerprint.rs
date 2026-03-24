@@ -410,11 +410,12 @@ impl ParallelMacProcessor {
     }
 
     /// Store a MAC atomically (16 bytes as two u64s)
+    /// Writes hi first, then lo (Release) so readers never see a torn/invalid MAC.
     fn store_mac(&self, idx: usize, mac: [u8; 16]) {
         let lo = u64::from_le_bytes(mac[0..8].try_into().unwrap());
         let hi = u64::from_le_bytes(mac[8..16].try_into().unwrap());
+        self.chunk_macs_hi[idx].store(hi, std::sync::atomic::Ordering::Relaxed);
         self.chunk_macs_lo[idx].store(lo, std::sync::atomic::Ordering::Release);
-        self.chunk_macs_hi[idx].store(hi, std::sync::atomic::Ordering::Release);
     }
 
     /// Load a MAC atomically, returning None if not yet computed (sentinel is u64::MAX)
@@ -548,7 +549,12 @@ impl ParallelMacProcessor {
                 state.bytes_received += data.len();
 
                 if state.bytes_received == actual_chunk_size {
-                    completed_data = Some(std::mem::take(&mut state.data));
+                    // Clone the completed buffer instead of taking it, so we can atomically
+                    // remove the entry in the same lock scope before returning.
+                    completed_data = Some(state.data.clone());
+                    // Remove the state entry immediately to prevent race: concurrent write
+                    // won't see the now-empty Vec and panic.
+                    states[chunk_idx] = None;
                 }
             } else {
                 let mut buf = vec![0u8; actual_chunk_size];
@@ -561,11 +567,10 @@ impl ParallelMacProcessor {
             }
         }
 
-        // If chunk is complete, compute MAC and clean up
+        // If chunk is complete, compute MAC (outside the lock)
         if let Some(data) = completed_data {
             let mac = self.compute_chunk_mac(&data);
             self.store_mac(chunk_idx, mac);
-            self.chunk_state.lock().unwrap()[chunk_idx] = None;
         }
     }
 
