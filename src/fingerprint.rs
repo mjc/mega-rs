@@ -956,7 +956,7 @@ mod tests {
         // but download chunks are fixed size (e.g., 128MB), so boundaries don't align.
         //
         // Example: MEGA chunks at 0, 128KB, 384KB, ..., 4.5MB, 5.5MB, 6.5MB, ...
-        // Download chunk at 5MB would split the MEGA chunk from 4.5MB-5.5MB.
+        // Download chunk (32MB) at 5MB would split the MEGA chunk from 4.5MB-5.5MB.
 
         // Create ~6MB of data to span the variable-size MEGA chunk region
         let data: Vec<u8> = (0..6_000_000).map(|i| (i % 256) as u8).collect();
@@ -995,7 +995,7 @@ mod tests {
     fn compute_macs_for_data_parallel_simulation() {
         // Simulate parallel workers with interleaved chunk processing.
         // Worker 0 gets chunks 0, 2, 4, ... and Worker 1 gets chunks 1, 3, 5, ...
-        // This tests concurrent access to the DashMap and partial chunk buffering.
+        // This tests concurrent access to ParallelMacProcessor and partial chunk buffering.
 
         let data: Vec<u8> = (0..10_000_000).map(|i| (i % 256) as u8).collect();
         let size = data.len() as u64;
