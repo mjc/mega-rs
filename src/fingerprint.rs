@@ -301,6 +301,42 @@ struct ChunkInfo {
 ///
 /// Uses lock-free atomics (AtomicU64 pairs) for MACs and a Mutex only for partial chunks.
 #[cfg(feature = "parallel")]
+struct MacEntry {
+    lo: std::sync::atomic::AtomicU64,
+    hi: std::sync::atomic::AtomicU64,
+    computed: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(feature = "parallel")]
+impl MacEntry {
+    fn store(&self, mac: [u8; 16]) {
+        let lo = u64::from_le_bytes(mac[0..8].try_into().unwrap());
+        let hi = u64::from_le_bytes(mac[8..16].try_into().unwrap());
+        self.hi.store(hi, std::sync::atomic::Ordering::Relaxed);
+        self.lo.store(lo, std::sync::atomic::Ordering::Relaxed);
+        // Publish the MAC by setting the computed flag with Release ordering
+        self.computed.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn load(&self) -> Option<[u8; 16]> {
+        // Check the computed flag first with Acquire ordering
+        if !self.computed.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        let lo = self.lo.load(std::sync::atomic::Ordering::Relaxed);
+        let hi = self.hi.load(std::sync::atomic::Ordering::Relaxed);
+        let mut mac = [0u8; 16];
+        mac[0..8].copy_from_slice(&lo.to_le_bytes());
+        mac[8..16].copy_from_slice(&hi.to_le_bytes());
+        Some(mac)
+    }
+
+    fn is_computed(&self) -> bool {
+        self.computed.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+#[cfg(feature = "parallel")]
 pub struct ParallelMacProcessor {
     aes_key: [u8; 16],
     aes_iv_full: [u8; 16],
@@ -309,11 +345,8 @@ pub struct ParallelMacProcessor {
     // Pre-computed chunk boundaries for O(1)/O(log n) lookups
     chunk_boundaries: Box<[ChunkInfo]>,
 
-    // Computed MACs per MEGA chunk: each MAC is 16 bytes stored as two u64 atomics
-    chunk_macs_lo: Box<[std::sync::atomic::AtomicU64]>,
-    chunk_macs_hi: Box<[std::sync::atomic::AtomicU64]>,
-    // Separate computed flag to avoid false negatives from valid MAC values that equal u64::MAX
-    chunk_macs_computed: Box<[std::sync::atomic::AtomicBool]>,
+    // Computed MACs per MEGA chunk: 16-byte MAC stored as two u64s with computed flag
+    chunk_macs: Vec<MacEntry>,
 
     // Partial chunk state: (data buffer, bytes received)
     chunk_state: std::sync::Mutex<Vec<Option<ChunkState>>>,
@@ -360,14 +393,12 @@ impl ParallelMacProcessor {
             aes_iv_full,
             file_size,
             chunk_boundaries,
-            chunk_macs_lo: (0..num_chunks)
-                .map(|_| std::sync::atomic::AtomicU64::new(0))
-                .collect(),
-            chunk_macs_hi: (0..num_chunks)
-                .map(|_| std::sync::atomic::AtomicU64::new(0))
-                .collect(),
-            chunk_macs_computed: (0..num_chunks)
-                .map(|_| std::sync::atomic::AtomicBool::new(false))
+            chunk_macs: (0..num_chunks)
+                .map(|_| MacEntry {
+                    lo: std::sync::atomic::AtomicU64::new(0),
+                    hi: std::sync::atomic::AtomicU64::new(0),
+                    computed: std::sync::atomic::AtomicBool::new(false),
+                })
                 .collect(),
             chunk_state: std::sync::Mutex::new((0..num_chunks).map(|_| None).collect()),
         }
@@ -417,31 +448,17 @@ impl ParallelMacProcessor {
     /// Stores MAC values first (Relaxed), then sets the computed flag (Release) so readers
     /// see a complete, valid MAC when they observe the flag.
     fn store_mac(&self, idx: usize, mac: [u8; 16]) {
-        let lo = u64::from_le_bytes(mac[0..8].try_into().unwrap());
-        let hi = u64::from_le_bytes(mac[8..16].try_into().unwrap());
-        self.chunk_macs_hi[idx].store(hi, std::sync::atomic::Ordering::Relaxed);
-        self.chunk_macs_lo[idx].store(lo, std::sync::atomic::Ordering::Relaxed);
-        // Publish the MAC by setting the computed flag with Release ordering
-        self.chunk_macs_computed[idx].store(true, std::sync::atomic::Ordering::Release);
+        self.chunk_macs[idx].store(mac);
     }
 
     /// Load a MAC atomically, returning None if not yet computed
     fn load_mac(&self, idx: usize) -> Option<[u8; 16]> {
-        // Check the computed flag first with Acquire ordering
-        if !self.chunk_macs_computed[idx].load(std::sync::atomic::Ordering::Acquire) {
-            return None;
-        }
-        let lo = self.chunk_macs_lo[idx].load(std::sync::atomic::Ordering::Relaxed);
-        let hi = self.chunk_macs_hi[idx].load(std::sync::atomic::Ordering::Relaxed);
-        let mut mac = [0u8; 16];
-        mac[0..8].copy_from_slice(&lo.to_le_bytes());
-        mac[8..16].copy_from_slice(&hi.to_le_bytes());
-        Some(mac)
+        self.chunk_macs[idx].load()
     }
 
     /// Check if a MAC has been computed (without loading it)
     fn is_mac_computed(&self, idx: usize) -> bool {
-        self.chunk_macs_computed[idx].load(std::sync::atomic::Ordering::Acquire)
+        self.chunk_macs[idx].is_computed()
     }
 }
 
