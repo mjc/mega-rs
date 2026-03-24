@@ -93,6 +93,8 @@ struct DownloadContext {
 }
 
 async fn download_worker(client: &dyn HttpClient, ctx: DownloadContext) -> Result<()> {
+    let mut buffer = BytesMut::with_capacity(CHUNK_SIZE as usize);
+
     loop {
         let idx = ctx.next_chunk.fetch_add(1, Ordering::Relaxed);
         if idx >= ctx.num_chunks {
@@ -100,17 +102,15 @@ async fn download_worker(client: &dyn HttpClient, ctx: DownloadContext) -> Resul
         }
 
         let range = ChunkRange::new(idx, ctx.file_size);
-        let capacity = range.length as usize;
-        let mut buffer = BytesMut::with_capacity(capacity);
-        // SAFETY: We will fill all bytes via the read loop before use. The EOF check ensures
-        // we read exactly range.length bytes before sending the buffer downstream.
-        unsafe { buffer.set_len(capacity) };
+        let target_size = range.length as usize;
+        buffer.clear();
+        buffer.resize(target_size, 0);
 
         let url = range.url(&ctx.base_url).parse()?;
         let mut response = client.get(url).await?;
         let mut bytes_read = 0;
 
-        while bytes_read < range.length as usize {
+        while bytes_read < target_size {
             match response.read(&mut buffer[bytes_read..]).await? {
                 0 => {
                     // EOF before reaching expected bytes
@@ -142,7 +142,6 @@ async fn download_worker(client: &dyn HttpClient, ctx: DownloadContext) -> Resul
             }
         }
 
-        buffer.truncate(bytes_read);
         let chunk = DownloadedChunk {
             offset: range.offset,
             data: buffer.split(),
