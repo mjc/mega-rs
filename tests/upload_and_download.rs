@@ -161,9 +161,9 @@ async fn upload_and_parallel_download_test() {
         node,
         file.compat(),
         4,
-        Some(Arc::new(move |bytes: u64| {
+        Some(move |bytes: u64| {
             progress_clone.fetch_max(bytes, Ordering::Relaxed);
-        })),
+        }),
     )
     .await
     .expect("could not parallel-download test file");

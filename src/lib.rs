@@ -1,7 +1,7 @@
 //! This is an API client library for interacting with MEGA's API using Rust.
 
 use std::collections::HashMap;
-use std::sync::atomic::AtomicU64;
+use std::sync::{atomic::AtomicU64, Arc};
 use std::time::Duration;
 
 use aes::Aes128;
@@ -1203,7 +1203,7 @@ impl Client {
         &self,
         node: &Node,
         writer: W,
-        progress: Option<std::sync::Arc<dyn Fn(u64) + Send + Sync>>,
+        progress: Option<Arc<dyn Fn(u64) + Send + Sync>>,
     ) -> Result<()> {
         if !node.kind.is_file() {
             return Err(Error::NotAFileNode);
@@ -1319,7 +1319,7 @@ impl Client {
     where
         W: futures::io::AsyncWrite + futures::io::AsyncSeek + Unpin + Send + 'static,
     {
-        self.download_node_parallel_with_progress(node, writer, num_connections, None)
+        self.download_node_parallel_with_progress::<W, fn(u64)>(node, writer, num_connections, None)
             .await
     }
 
@@ -1332,18 +1332,19 @@ impl Client {
     /// * `node` - The node to download
     /// * `writer` - An async writer that supports seeking (e.g., any `futures::io::AsyncWrite + AsyncSeek`)
     /// * `num_connections` - Number of parallel download workers (recommended: 4-8 for optimal throughput)
-    /// * `progress` - Optional `Arc<dyn Fn(u64) + Send + Sync>` callback invoked with the cumulative number of bytes downloaded so far
+    /// * `progress` - Optional callback invoked with the cumulative number of bytes downloaded so far
     ///   (reports are monotonically increasing and may skip values due to concurrent worker ordering)
     #[cfg(feature = "parallel")]
-    pub async fn download_node_parallel_with_progress<W>(
+    pub async fn download_node_parallel_with_progress<W, F>(
         &self,
         node: &Node,
         writer: W,
         num_connections: usize,
-        progress: Option<std::sync::Arc<dyn Fn(u64) + Send + Sync>>,
+        progress: Option<F>,
     ) -> Result<()>
     where
         W: futures::io::AsyncWrite + futures::io::AsyncSeek + Unpin + Send + 'static,
+        F: Fn(u64) + Send + Sync + 'static,
     {
         if !node.kind.is_file() {
             return Err(Error::NotAFileNode);
@@ -1353,6 +1354,7 @@ impl Client {
         let expected_mac = node.condensed_mac.ok_or(Error::MissingCondensedMac)?;
 
         let (base_url, server_size) = self.get_download_url(node).await?;
+        let progress = progress.map(|cb| Arc::new(cb) as Arc<dyn Fn(u64) + Send + Sync>);
         parallel::download_parallel(
             &*self.client,
             node,
