@@ -94,7 +94,6 @@ struct DownloadContext {
 }
 
 async fn download_worker(client: &dyn HttpClient, ctx: DownloadContext) -> Result<()> {
-
     loop {
         let idx = ctx.next_chunk.fetch_add(1, Ordering::Relaxed);
         if idx >= ctx.num_chunks {
@@ -174,10 +173,10 @@ where
         let decrypted = tokio::task::spawn_blocking({
             let mut data = chunk.data;
             let mac = Arc::clone(&mac);
-            move || {
+            move || -> Result<Vec<u8>> {
                 decrypt(&aes_key, &aes_iv, offset, &mut data);
-                mac.add_chunk(offset, &data);
-                data
+                mac.add_chunk(offset, &data)?;
+                Ok(data)
             }
         })
         .await
@@ -185,7 +184,7 @@ where
             Error::from(std::io::Error::other(format!(
                 "spawn_blocking task failed: {e}"
             )))
-        })?;
+        })??;
 
         // Write to file
         writer.seek(SeekFrom::Start(offset)).await?;

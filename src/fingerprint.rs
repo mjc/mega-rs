@@ -1,3 +1,4 @@
+use std::io::{Error as IoError, ErrorKind};
 use std::pin::pin;
 
 use aes::Aes128;
@@ -5,7 +6,7 @@ use base64::prelude::{Engine, BASE64_URL_SAFE_NO_PAD};
 use cipher::{BlockEncryptMut, KeyIvInit};
 use futures::io::{AsyncRead, AsyncReadExt};
 
-use crate::Result;
+use crate::{Error, Result};
 
 /// Represents the node's fingerprint (useful for caching purposes).
 #[derive(Debug, Clone, PartialEq)]
@@ -360,6 +361,26 @@ struct ChunkState {
 }
 
 #[cfg(feature = "parallel")]
+fn parallel_chunk_range_error(start: u64, end: u64, file_size: u64) -> Error {
+    Error::Other {
+        source: Box::new(IoError::new(
+            ErrorKind::InvalidData,
+            format!("parallel chunk range [{start}, {end}) is invalid for file size {file_size}"),
+        )),
+    }
+}
+
+#[cfg(feature = "parallel")]
+fn parallel_chunk_data_error(start: usize, end: usize, chunk_size: usize) -> Error {
+    Error::Other {
+        source: Box::new(IoError::new(
+            ErrorKind::InvalidData,
+            format!("parallel chunk data range [{start}, {end}) exceeds chunk size {chunk_size}"),
+        )),
+    }
+}
+
+#[cfg(feature = "parallel")]
 impl ParallelMacProcessor {
     pub fn new(file_size: u64, aes_key: &[u8; 16], aes_iv: &[u8; 8]) -> Self {
         let aes_iv_full = {
@@ -466,24 +487,27 @@ impl ParallelMacProcessor {
     /// - One initial binary search to find the starting chunk
     /// - Then linear iteration through successive chunks (no per-iteration searches)
     /// - Complete chunks compute MACs directly; partial chunks are buffered
-    pub fn add_chunk(&self, offset: u64, data: &[u8]) {
-        // Validate that the data range doesn't exceed file size
-        if let Some(end_offset) = offset.checked_add(data.len() as u64) {
-            debug_assert!(
-                end_offset <= self.file_size,
-                "add_chunk: data range [{}, {}) exceeds file_size {}",
+    pub fn add_chunk(&self, offset: u64, data: &[u8]) -> Result<()> {
+        let data_len = data.len();
+        let end_offset = offset.checked_add(data_len as u64).ok_or_else(|| {
+            parallel_chunk_range_error(
+                offset,
+                offset.saturating_add(data_len as u64),
+                self.file_size,
+            )
+        })?;
+
+        if end_offset > self.file_size {
+            return Err(parallel_chunk_range_error(
                 offset,
                 end_offset,
-                self.file_size
-            );
-        } else {
-            debug_assert!(false, "add_chunk: offset overflow");
+                self.file_size,
+            ));
         }
 
-        // One binary search to find the starting MEGA chunk
-        let Some((mut chunk_idx, _)) = self.mega_chunk_for_offset(offset) else {
-            return;
-        };
+        let (mut chunk_idx, _) = self
+            .mega_chunk_for_offset(offset)
+            .ok_or_else(|| parallel_chunk_range_error(offset, end_offset, self.file_size))?;
 
         let mut pos = offset;
         let mut remaining = data;
@@ -505,18 +529,24 @@ impl ParallelMacProcessor {
                 }
             } else {
                 // Slow path: partial chunk at boundary - use buffering
-                self.buffer_partial_chunk(
+                if let Some(data) = self.buffer_partial_chunk(
                     chunk_idx,
                     offset_in_chunk,
                     for_this_chunk,
                     info.size as usize,
-                );
+                )? {
+                    let mac = compute_chunk_mac_inner(&self.aes_key, &self.aes_iv_full, &data);
+                    self.chunk_macs[chunk_idx].store(mac);
+                    self.lock_chunk_state()[chunk_idx] = None;
+                }
             }
 
             pos += to_take as u64;
             remaining = rest;
             chunk_idx += 1; // Linear advance — no per-iteration binary search
         }
+
+        Ok(())
     }
 
     /// Buffer partial chunk data, computing MAC when complete.
@@ -527,52 +557,72 @@ impl ParallelMacProcessor {
         offset_in_chunk: usize,
         data: &[u8],
         actual_chunk_size: usize,
-    ) {
-        // Skip if another thread already completed this chunk's MAC
-        if self.chunk_macs[chunk_idx].is_computed() {
-            return;
+    ) -> Result<Option<Vec<u8>>> {
+        if offset_in_chunk
+            .checked_add(data.len())
+            .map_or(true, |end| end > actual_chunk_size)
+        {
+            return Err(parallel_chunk_data_error(
+                offset_in_chunk,
+                offset_in_chunk + data.len(),
+                actual_chunk_size,
+            ));
         }
 
         let mut completed_data = None;
 
         {
             let mut states = self.lock_chunk_state();
+
+            if self.chunk_macs[chunk_idx].is_computed() {
+                states[chunk_idx] = None;
+                return Ok(None);
+            }
+
             if let Some(state) = &mut states[chunk_idx] {
-                // Skip if another thread is already finalizing this chunk
                 if state.bytes_received == actual_chunk_size {
-                    return;
+                    states[chunk_idx] = None;
+                    return Ok(None);
                 }
+
+                if state
+                    .bytes_received
+                    .checked_add(data.len())
+                    .map_or(true, |sum| sum > actual_chunk_size)
+                {
+                    return Err(parallel_chunk_data_error(
+                        state.bytes_received,
+                        state.bytes_received + data.len(),
+                        actual_chunk_size,
+                    ));
+                }
+
                 state.data[offset_in_chunk..offset_in_chunk + data.len()].copy_from_slice(data);
                 state.bytes_received += data.len();
 
                 if state.bytes_received == actual_chunk_size {
-                    // Clone the completed buffer. Keep state in place until after MAC is stored
-                    // to prevent another thread from allocating a new state in the None case.
                     completed_data = Some(state.data.clone());
                 }
-            } else {
-                // Only allocate a new state if the MAC hasn't already been computed.
-                // This guards against the race window where another thread is finalizing.
-                if !self.chunk_macs[chunk_idx].is_computed() {
-                    let mut buf = vec![0u8; actual_chunk_size];
-                    buf[offset_in_chunk..offset_in_chunk + data.len()].copy_from_slice(data);
+            } else if !self.chunk_macs[chunk_idx].is_computed() {
+                let mut buf = vec![0u8; actual_chunk_size];
+                buf[offset_in_chunk..offset_in_chunk + data.len()].copy_from_slice(data);
 
-                    states[chunk_idx] = Some(ChunkState {
-                        data: buf,
-                        bytes_received: data.len(),
-                    });
+                states[chunk_idx] = Some(ChunkState {
+                    data: buf,
+                    bytes_received: data.len(),
+                });
+
+                if data.len() == actual_chunk_size {
+                    completed_data = Some(states[chunk_idx].as_ref().unwrap().data.clone());
                 }
             }
         }
 
-        // If chunk is complete, compute MAC and store it (outside the lock)
         if let Some(data) = completed_data {
-            let mac = compute_chunk_mac_inner(&self.aes_key, &self.aes_iv_full, &data);
-            self.chunk_macs[chunk_idx].store(mac);
-
-            // Now that MAC is stored, clear the state to free memory
-            self.lock_chunk_state()[chunk_idx] = None;
+            return Ok(Some(data));
         }
+
+        Ok(None)
     }
 
     /// Finalize and return the combined MAC
@@ -859,7 +909,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "parallel")]
-    fn parallel_mac_matches_buffer_in_order() {
+    fn parallel_mac_matches_buffer_in_order() -> Result<()> {
         // Test ParallelMacProcessor with chunks arriving in order
         let data: Vec<u8> = (0..500_000).map(|i| (i % 256) as u8).collect();
         let size = data.len() as u64;
@@ -872,17 +922,18 @@ mod tests {
         let mut offset = 0u64;
         while offset < size {
             let end = (offset + chunk_size as u64).min(size);
-            processor.add_chunk(offset, &data[offset as usize..end as usize]);
+            processor.add_chunk(offset, &data[offset as usize..end as usize])?;
             offset = end;
         }
 
         let parallel_mac = processor.finalize().unwrap();
         assert_eq!(parallel_mac, buffer_mac);
+        Ok(())
     }
 
     #[test]
     #[cfg(feature = "parallel")]
-    fn parallel_mac_matches_buffer_out_of_order() {
+    fn parallel_mac_matches_buffer_out_of_order() -> Result<()> {
         // Test ParallelMacProcessor with chunks arriving out of order
         let data: Vec<u8> = (0..500_000).map(|i| (i % 256) as u8).collect();
         let size = data.len() as u64;
@@ -904,16 +955,17 @@ mod tests {
         // Deliver in reverse order
         let processor = ParallelMacProcessor::new(size, &TEST_KEY, &TEST_IV);
         for (offset, start, end) in chunk_ranges.into_iter().rev() {
-            processor.add_chunk(offset, &data[start..end]);
+            processor.add_chunk(offset, &data[start..end])?;
         }
 
         let parallel_mac = processor.finalize().unwrap();
         assert_eq!(parallel_mac, buffer_mac);
+        Ok(())
     }
 
     #[test]
     #[cfg(feature = "parallel")]
-    fn parallel_mac_matches_buffer_large_file() {
+    fn parallel_mac_matches_buffer_large_file() -> Result<()> {
         // Test with data spanning multiple MEGA chunk sizes (128KB -> 1MB)
         let data: Vec<u8> = (0..3_000_000).map(|i| (i % 256) as u8).collect();
         let size = data.len() as u64;
@@ -936,22 +988,23 @@ mod tests {
         let processor = ParallelMacProcessor::new(size, &TEST_KEY, &TEST_IV);
         for (i, &(offset, start, end)) in chunk_ranges.iter().enumerate() {
             if i % 2 == 0 {
-                processor.add_chunk(offset, &data[start..end]);
+                processor.add_chunk(offset, &data[start..end])?;
             }
         }
         for (i, &(offset, start, end)) in chunk_ranges.iter().enumerate() {
             if i % 2 == 1 {
-                processor.add_chunk(offset, &data[start..end]);
+                processor.add_chunk(offset, &data[start..end])?;
             }
         }
 
         let parallel_mac = processor.finalize().unwrap();
         assert_eq!(parallel_mac, buffer_mac);
+        Ok(())
     }
 
     #[test]
     #[cfg(feature = "parallel")]
-    fn add_chunk_unaligned_boundaries() {
+    fn add_chunk_unaligned_boundaries() -> Result<()> {
         // Test add_chunk when download chunks don't align with MEGA chunk boundaries.
         // This is the bug that caused CondensedMacMismatch: MEGA chunks are 128KB->1MB,
         // but download chunks are fixed size (e.g., 128MB), so boundaries don't align.
@@ -977,7 +1030,7 @@ mod tests {
             let chunk_data = &data[offset as usize..end];
 
             // Test the new add_chunk method with unaligned boundaries
-            processor.add_chunk(offset, chunk_data);
+            processor.add_chunk(offset, chunk_data)?;
 
             offset = end as u64;
         }
@@ -987,11 +1040,12 @@ mod tests {
             computed_mac, expected_mac,
             "MAC mismatch with unaligned download chunks"
         );
+        Ok(())
     }
 
     #[test]
     #[cfg(feature = "parallel")]
-    fn add_chunk_parallel_simulation() {
+    fn add_chunk_parallel_simulation() -> Result<()> {
         // Simulate parallel workers with interleaved chunk processing.
         // Worker 0 gets chunks 0, 2, 4, ... and Worker 1 gets chunks 1, 3, 5, ...
         // This tests concurrent access to ParallelMacProcessor and partial chunk buffering.
@@ -1018,13 +1072,13 @@ mod tests {
         // Worker 0: even chunks first
         for (i, &(offset, start, end)) in chunks.iter().enumerate() {
             if i % 2 == 0 {
-                processor.add_chunk(offset, &data[start..end]);
+                processor.add_chunk(offset, &data[start..end])?;
             }
         }
         // Worker 1: odd chunks
         for (i, &(offset, start, end)) in chunks.iter().enumerate() {
             if i % 2 == 1 {
-                processor.add_chunk(offset, &data[start..end]);
+                processor.add_chunk(offset, &data[start..end])?;
             }
         }
 
@@ -1033,5 +1087,6 @@ mod tests {
             computed_mac, expected_mac,
             "MAC mismatch with parallel worker simulation"
         );
+        Ok(())
     }
 }
