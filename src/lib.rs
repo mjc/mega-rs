@@ -1209,6 +1209,9 @@ impl Client {
             return Err(Error::NotAFileNode);
         }
 
+        let aes_iv = node.aes_iv.ok_or(Error::MissingNodeAesIv)?;
+        let expected_mac = node.condensed_mac.ok_or(Error::MissingCondensedMac)?;
+
         let (base_url, server_size) = self.get_download_url(node).await?;
         let size = server_size;
         // Use inclusive end range (MEGA API expects end byte inclusive), or early return for empty files
@@ -1224,7 +1227,7 @@ impl Client {
 
         let mut file_iv = [0u8; 16];
 
-        file_iv[..8].copy_from_slice(node.aes_iv.unwrap_or_default().as_slice());
+        file_iv[..8].copy_from_slice(&aes_iv);
         let mut ctr = ctr::Ctr128BE::<Aes128>::new(node.aes_key[..].into(), (&file_iv).into());
 
         let (condensed_mac_reader, condensed_mac_writer) = sluice::pipe::pipe();
@@ -1273,7 +1276,7 @@ impl Client {
 
         let condensed_mac_future = {
             let aes_key = node.aes_key;
-            let aes_iv = node.aes_iv.unwrap();
+            let aes_iv = aes_iv;
             async move {
                 fingerprint::compute_condensed_mac(condensed_mac_reader, size, &aes_key, &aes_iv)
                     .await
@@ -1282,7 +1285,7 @@ impl Client {
 
         let (_, condensed_mac) = futures::try_join!(download_future, condensed_mac_future)?;
 
-        if condensed_mac != node.condensed_mac.unwrap_or_default() {
+        if condensed_mac != expected_mac {
             return Err(Error::CondensedMacMismatch);
         }
 
@@ -1346,6 +1349,9 @@ impl Client {
             return Err(Error::NotAFileNode);
         }
 
+        let aes_iv = node.aes_iv.ok_or(Error::MissingNodeAesIv)?;
+        let expected_mac = node.condensed_mac.ok_or(Error::MissingCondensedMac)?;
+
         let (base_url, server_size) = self.get_download_url(node).await?;
         parallel::download_parallel(
             &*self.client,
@@ -1355,6 +1361,8 @@ impl Client {
             writer,
             num_connections,
             progress,
+            aes_iv,
+            expected_mac,
         )
         .await
     }

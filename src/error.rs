@@ -56,6 +56,12 @@ pub enum Error {
     /// Failed condensed MAC verification.
     #[error("condensed MAC mismatch")]
     CondensedMacMismatch,
+    /// Missing AES IV for a file node.
+    #[error("missing AES IV for file node")]
+    MissingNodeAesIv,
+    /// Missing condensed MAC for a file node.
+    #[error("missing condensed MAC for file node")]
+    MissingCondensedMac,
     /// Node is not a file (e.g., attempting to download a folder).
     #[error("node is not a file")]
     NotAFileNode,

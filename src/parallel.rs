@@ -213,6 +213,8 @@ pub(crate) async fn download_parallel<W>(
     writer: W,
     num_connections: usize,
     progress_callback: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+    aes_iv: [u8; 8],
+    expected_mac: [u8; 8],
 ) -> Result<()>
 where
     W: futures::io::AsyncWrite + futures::io::AsyncSeek + Unpin + Send + 'static,
@@ -230,7 +232,7 @@ where
     }
 
     let aes_key = node.aes_key;
-    let aes_iv_8 = node.aes_iv.unwrap_or_default();
+    let aes_iv_8 = aes_iv;
     // CTR IV: [aes_iv, zeros] - NOT repeated!
     let mut aes_iv_16 = [0u8; 16];
     aes_iv_16[..8].copy_from_slice(&aes_iv_8);
@@ -302,7 +304,6 @@ where
 
     // Finalize MAC
     let computed_mac = mac.finalize().ok_or(Error::CondensedMacMismatch)?;
-    let expected_mac = node.condensed_mac.unwrap_or_default();
 
     if computed_mac == expected_mac {
         Ok(())
