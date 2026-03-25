@@ -1180,7 +1180,7 @@ impl Client {
     ///
     /// This is the simplest download method, suitable for smaller files or when
     /// a single connection is preferred. For better performance on large files,
-    /// consider using [`download_node_parallel`](Self::download_node_parallel).
+    /// consider using `download_node_parallel`.
     ///
     /// # Arguments
     /// * `node` - The node to download
@@ -1193,7 +1193,7 @@ impl Client {
     ///
     /// Provides the same functionality as [`download_node`](Self::download_node)
     /// but allows monitoring download progress via a callback. For faster downloads
-    /// on large files, use [`download_node_parallel`](Self::download_node_parallel).
+    /// on large files, use `download_node_parallel`.
     ///
     /// # Arguments
     /// * `node` - The node to download
@@ -1325,7 +1325,7 @@ impl Client {
 
     /// Downloads a file using multiple parallel connections with progress tracking.
     ///
-    /// Same as [`download_node_parallel`](Self::download_node_parallel) but with
+    /// Same as `download_node_parallel` but with
     /// an optional progress callback.
     ///
     /// # Arguments
