@@ -9,7 +9,7 @@ use base64::prelude::{Engine, BASE64_URL_SAFE_NO_PAD};
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use cipher::generic_array::GenericArray;
 use cipher::{BlockDecryptMut, BlockEncrypt, BlockEncryptMut, KeyInit, KeyIvInit, StreamCipher};
-use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, Cursor};
 use hmac::{Hmac, Mac};
 use pbkdf2::pbkdf2_hmac_array;
 use secrecy::{ExposeSecret, SecretBox};
@@ -1219,6 +1219,16 @@ impl Client {
         if size == 0 {
             if let Some(cb) = progress {
                 cb(0);
+            }
+            let empty_mac = fingerprint::compute_condensed_mac(
+                Cursor::new(Vec::new()),
+                0,
+                &node.aes_key,
+                &aes_iv,
+            )
+            .await?;
+            if empty_mac != expected_mac {
+                return Err(Error::CondensedMacMismatch);
             }
             return Ok(());
         }

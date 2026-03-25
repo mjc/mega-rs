@@ -1,3 +1,4 @@
+#[cfg(feature = "parallel")]
 use std::io::{Error as IoError, ErrorKind};
 use std::pin::pin;
 
