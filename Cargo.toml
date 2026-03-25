@@ -62,8 +62,8 @@ secrecy = { version = "0.10.2", features = ["serde"] }
 default = ["reqwest", "rustls-tls"]
 reqwest = ["dep:reqwest", "dep:tokio", "dep:tokio-util", "dep:bytes"]
 parallel = ["reqwest"]
-native-tls = ["reqwest", "reqwest/default-tls"]
-rustls-tls = []
+native-tls = ["reqwest", "dep:reqwest/default-tls"]
+rustls-tls = ["dep:reqwest/rustls-tls"]
 
 [dev-dependencies]
 async-read-progress = "0.2.0"
