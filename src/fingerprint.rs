@@ -315,7 +315,8 @@ impl MacEntry {
         self.hi.store(hi, std::sync::atomic::Ordering::Relaxed);
         self.lo.store(lo, std::sync::atomic::Ordering::Relaxed);
         // Publish the MAC by setting the computed flag with Release ordering
-        self.computed.store(true, std::sync::atomic::Ordering::Release);
+        self.computed
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     fn load(&self) -> Option<[u8; 16]> {
@@ -429,6 +430,12 @@ impl ParallelMacProcessor {
         Some((idx, offset - chunk_start))
     }
 
+    fn lock_chunk_state(&self) -> std::sync::MutexGuard<'_, Vec<Option<ChunkState>>> {
+        match self.chunk_state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
 }
 
 /// Standalone MAC computation for use with spawn_blocking
@@ -474,7 +481,9 @@ impl ParallelMacProcessor {
         }
 
         // One binary search to find the starting MEGA chunk
-        let Some((mut chunk_idx, _)) = self.mega_chunk_for_offset(offset) else { return };
+        let Some((mut chunk_idx, _)) = self.mega_chunk_for_offset(offset) else {
+            return;
+        };
 
         let mut pos = offset;
         let mut remaining = data;
@@ -490,7 +499,8 @@ impl ParallelMacProcessor {
             // Fast path: complete, aligned chunk - compute MAC directly
             if offset_in_chunk == 0 && to_take == info.size as usize {
                 if !self.chunk_macs[chunk_idx].is_computed() {
-                    let mac = compute_chunk_mac_inner(&self.aes_key, &self.aes_iv_full, for_this_chunk);
+                    let mac =
+                        compute_chunk_mac_inner(&self.aes_key, &self.aes_iv_full, for_this_chunk);
                     self.chunk_macs[chunk_idx].store(mac);
                 }
             } else {
@@ -505,7 +515,7 @@ impl ParallelMacProcessor {
 
             pos += to_take as u64;
             remaining = rest;
-            chunk_idx += 1;  // Linear advance — no per-iteration binary search
+            chunk_idx += 1; // Linear advance — no per-iteration binary search
         }
     }
 
@@ -526,7 +536,7 @@ impl ParallelMacProcessor {
         let mut completed_data = None;
 
         {
-            let mut states = self.chunk_state.lock().expect("chunk_state mutex poisoned");
+            let mut states = self.lock_chunk_state();
             if let Some(state) = &mut states[chunk_idx] {
                 // Skip if another thread is already finalizing this chunk
                 if state.bytes_received == actual_chunk_size {
@@ -561,7 +571,7 @@ impl ParallelMacProcessor {
             self.chunk_macs[chunk_idx].store(mac);
 
             // Now that MAC is stored, clear the state to free memory
-            self.chunk_state.lock().expect("chunk_state mutex poisoned")[chunk_idx] = None;
+            self.lock_chunk_state()[chunk_idx] = None;
         }
     }
 
