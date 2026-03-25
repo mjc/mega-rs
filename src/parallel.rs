@@ -205,18 +205,17 @@ where
 /// Downloads a file using parallel connections.
 ///
 /// Downloads run in parallel and don't block on processing.
-pub(crate) async fn download_parallel<W, F>(
+pub(crate) async fn download_parallel<W>(
     client: &dyn HttpClient,
     node: &Node,
     base_url: String,
     server_size: u64,
     writer: W,
     num_connections: usize,
-    progress_callback: Option<F>,
+    progress_callback: Option<Arc<dyn Fn(u64) + Send + Sync>>,
 ) -> Result<()>
 where
     W: futures::io::AsyncWrite + futures::io::AsyncSeek + Unpin + Send + 'static,
-    F: Fn(u64) + Send + Sync + 'static,
 {
     if !node.kind.is_file() {
         return Err(Error::NotAFileNode);
@@ -251,8 +250,7 @@ where
     let mac = Arc::new(ParallelMacProcessor::new(file_size, &aes_key, &aes_iv_8));
 
     // Progress callback with cumulative tracking and monotonic reporting
-    let progress: Option<Arc<dyn Fn(u64) + Send + Sync>> =
-        progress_callback.map(|f| Arc::new(f) as _);
+    let progress: Option<Arc<dyn Fn(u64) + Send + Sync>> = progress_callback;
     let progress_total = progress.as_ref().map(|_| Arc::new(AtomicU64::new(0)));
     let progress_reported = progress.as_ref().map(|_| Arc::new(AtomicU64::new(0)));
 

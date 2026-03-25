@@ -1186,8 +1186,7 @@ impl Client {
     /// * `node` - The node to download
     /// * `writer` - An async writer to write the decrypted file contents to
     pub async fn download_node<W: AsyncWrite>(&self, node: &Node, writer: W) -> Result<()> {
-        self.download_node_with_progress::<_, fn(u64)>(node, writer, None)
-            .await
+        self.download_node_with_progress(node, writer, None).await
     }
 
     /// Downloads a file with optional progress tracking via a single connection.
@@ -1199,18 +1198,13 @@ impl Client {
     /// # Arguments
     /// * `node` - The node to download
     /// * `writer` - An async writer to write the decrypted file contents to
-    /// * `progress` - Optional callback invoked with cumulative bytes downloaded so far
-    pub async fn download_node_with_progress<W: AsyncWrite, F>(
+    /// * `progress` - Optional `Arc<dyn Fn(u64) + Send + Sync>` callback invoked with cumulative bytes downloaded so far
+    pub async fn download_node_with_progress<W: AsyncWrite>(
         &self,
         node: &Node,
         writer: W,
-        progress: Option<F>,
-    ) -> Result<()>
-    where
-        F: Fn(u64),
-    {
-        use std::sync::Arc;
-
+        progress: Option<std::sync::Arc<dyn Fn(u64) + Send + Sync>>,
+    ) -> Result<()> {
         if !node.kind.is_file() {
             return Err(Error::NotAFileNode);
         }
@@ -1236,8 +1230,6 @@ impl Client {
         let (condensed_mac_reader, condensed_mac_writer) = sluice::pipe::pipe();
 
         // Progress tracking
-        let progress = progress.map(Arc::new);
-
         let download_future = async move {
             let mut chunk_size: u64 = 131_072; // 2^17
             let mut total_written = 0u64;
@@ -1324,7 +1316,7 @@ impl Client {
     where
         W: futures::io::AsyncWrite + futures::io::AsyncSeek + Unpin + Send + 'static,
     {
-        self.download_node_parallel_with_progress::<_, fn(u64)>(node, writer, num_connections, None)
+        self.download_node_parallel_with_progress(node, writer, num_connections, None)
             .await
     }
 
@@ -1337,20 +1329,23 @@ impl Client {
     /// * `node` - The node to download
     /// * `writer` - An async writer that supports seeking (e.g., any `futures::io::AsyncWrite + AsyncSeek`)
     /// * `num_connections` - Number of parallel download workers (recommended: 4-8 for optimal throughput)
-    /// * `progress` - Optional callback invoked with the cumulative number of bytes downloaded so far
+    /// * `progress` - Optional `Arc<dyn Fn(u64) + Send + Sync>` callback invoked with the cumulative number of bytes downloaded so far
     ///   (reports are monotonically increasing and may skip values due to concurrent worker ordering)
     #[cfg(feature = "parallel")]
-    pub async fn download_node_parallel_with_progress<W, F>(
+    pub async fn download_node_parallel_with_progress<W>(
         &self,
         node: &Node,
         writer: W,
         num_connections: usize,
-        progress: Option<F>,
+        progress: Option<std::sync::Arc<dyn Fn(u64) + Send + Sync>>,
     ) -> Result<()>
     where
         W: futures::io::AsyncWrite + futures::io::AsyncSeek + Unpin + Send + 'static,
-        F: Fn(u64) + Send + Sync + 'static,
     {
+        if !node.kind.is_file() {
+            return Err(Error::NotAFileNode);
+        }
+
         let (base_url, server_size) = self.get_download_url(node).await?;
         parallel::download_parallel(
             &*self.client,
