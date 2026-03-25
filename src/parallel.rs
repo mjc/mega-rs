@@ -11,11 +11,12 @@ use std::sync::Arc;
 
 use aes::Aes128;
 use cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
+use futures::io::Cursor;
 use futures::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use crate::error::{Error, Result};
-use crate::fingerprint::ParallelMacProcessor;
+use crate::fingerprint::{compute_condensed_mac, ParallelMacProcessor};
 use crate::http::HttpClient;
 use crate::Node;
 
@@ -222,15 +223,24 @@ where
     }
 
     let file_size = server_size;
+    let aes_key = node.aes_key;
+    let aes_iv_8 = aes_iv;
+
     if file_size == 0 {
         if let Some(cb) = progress_callback {
             cb(0);
         }
-        return Ok(());
+
+        let empty_mac =
+            compute_condensed_mac(Cursor::new(Vec::new()), 0, &aes_key, &aes_iv_8).await?;
+
+        return if empty_mac == expected_mac {
+            Ok(())
+        } else {
+            Err(Error::CondensedMacMismatch)
+        };
     }
 
-    let aes_key = node.aes_key;
-    let aes_iv_8 = aes_iv;
     // CTR IV: [aes_iv, zeros] - NOT repeated!
     let mut aes_iv_16 = [0u8; 16];
     aes_iv_16[..8].copy_from_slice(&aes_iv_8);
