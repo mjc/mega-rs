@@ -359,6 +359,7 @@ pub struct ParallelMacProcessor {
 struct ChunkState {
     data: Vec<u8>,
     bytes_received: usize,
+    coverage: Vec<u8>,
 }
 
 #[cfg(feature = "parallel")]
@@ -586,20 +587,15 @@ impl ParallelMacProcessor {
                     return Ok(None);
                 }
 
-                if state
-                    .bytes_received
-                    .checked_add(data.len())
-                    .map_or(true, |sum| sum > actual_chunk_size)
-                {
-                    return Err(parallel_chunk_data_error(
-                        state.bytes_received,
-                        state.bytes_received + data.len(),
-                        actual_chunk_size,
-                    ));
+                let mut new_bytes = 0;
+                for idx in offset_in_chunk..offset_in_chunk + data.len() {
+                    if state.coverage[idx] == 0 {
+                        state.coverage[idx] = 1;
+                        new_bytes += 1;
+                    }
                 }
-
                 state.data[offset_in_chunk..offset_in_chunk + data.len()].copy_from_slice(data);
-                state.bytes_received += data.len();
+                state.bytes_received += new_bytes;
 
                 if state.bytes_received == actual_chunk_size {
                     completed_data = Some(state.data.clone());
@@ -607,10 +603,15 @@ impl ParallelMacProcessor {
             } else if !self.chunk_macs[chunk_idx].is_computed() {
                 let mut buf = vec![0u8; actual_chunk_size];
                 buf[offset_in_chunk..offset_in_chunk + data.len()].copy_from_slice(data);
+                let mut coverage = vec![0u8; actual_chunk_size];
+                for idx in offset_in_chunk..offset_in_chunk + data.len() {
+                    coverage[idx] = 1;
+                }
 
                 states[chunk_idx] = Some(ChunkState {
                     data: buf,
                     bytes_received: data.len(),
+                    coverage,
                 });
 
                 if data.len() == actual_chunk_size {
