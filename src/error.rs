@@ -62,6 +62,9 @@ pub enum Error {
     /// Missing condensed MAC for a file node.
     #[error("missing condensed MAC for file node")]
     MissingCondensedMac,
+    /// Requested too many parallel download workers.
+    #[error("requested parallel download worker count exceeds the maximum allowed")]
+    ParallelismTooHigh,
     /// Node is not a file (e.g., attempting to download a folder).
     #[error("node is not a file")]
     NotAFileNode,

@@ -1296,7 +1296,8 @@ impl Client {
     ///
     /// This method is optimized for larger files where bandwidth efficiency matters.
     /// It downloads file chunks in parallel while maintaining the integrity of the file
-    /// through concurrent MAC verification, bounded to memory usage of ~(num_workers × 32MB).
+    /// through concurrent MAC verification, with peak memory roughly `2 × num_workers × CHUNK_SIZE`
+    /// (each worker’s read buffer plus the channel’s queued chunks).
     ///
     /// **Architecture:**
     /// - Multiple download workers fetch 32MB chunks concurrently from the server
@@ -1309,6 +1310,9 @@ impl Client {
     /// * `node` - The node to download
     /// * `writer` - An async writer that supports seeking (e.g., any `futures::io::AsyncWrite + AsyncSeek`)
     /// * `num_connections` - Number of parallel download workers (recommended: 4-8 for optimal throughput)
+    ///
+    /// # Errors
+    /// * [`Error::ParallelismTooHigh`] if you request more than 32 workers (to keep memory bounded).
     #[cfg(feature = "parallel")]
     pub async fn download_node_parallel<W>(
         &self,

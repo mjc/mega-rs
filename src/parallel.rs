@@ -10,7 +10,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use aes::Aes128;
-use bytes::BytesMut;
 use cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
 use futures::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -22,6 +21,8 @@ use crate::Node;
 
 /// Download chunk size (32 MB) - larger chunks reduce HTTP overhead.
 const CHUNK_SIZE: u64 = 32 * 1024 * 1024;
+/// Maximum number of workers we will spawn to keep RAM bounded.
+const MAX_PARALLEL_WORKERS: usize = 32;
 
 // ============================================================================
 // Message type
@@ -30,7 +31,7 @@ const CHUNK_SIZE: u64 = 32 * 1024 * 1024;
 /// Downloaded chunk (encrypted, mutable for in-place decryption).
 struct DownloadedChunk {
     offset: u64,
-    data: BytesMut,
+    data: Vec<u8>,
 }
 
 // ============================================================================
@@ -93,7 +94,6 @@ struct DownloadContext {
 }
 
 async fn download_worker(client: &dyn HttpClient, ctx: DownloadContext) -> Result<()> {
-    let mut buffer = BytesMut::with_capacity(CHUNK_SIZE as usize);
 
     loop {
         let idx = ctx.next_chunk.fetch_add(1, Ordering::Relaxed);
@@ -103,8 +103,7 @@ async fn download_worker(client: &dyn HttpClient, ctx: DownloadContext) -> Resul
 
         let range = ChunkRange::new(idx, ctx.file_size);
         let target_size = range.length as usize;
-        buffer.clear();
-        buffer.resize(target_size, 0);
+        let mut buffer = vec![0u8; target_size];
 
         let url = range.url(&ctx.base_url).parse()?;
         let mut response = client.get(url).await?;
@@ -144,7 +143,7 @@ async fn download_worker(client: &dyn HttpClient, ctx: DownloadContext) -> Resul
 
         let chunk = DownloadedChunk {
             offset: range.offset,
-            data: buffer.split(),
+            data: buffer,
         };
 
         if ctx.tx.send(chunk).await.is_err() {
@@ -178,7 +177,7 @@ where
             move || {
                 decrypt(&aes_key, &aes_iv, offset, &mut data);
                 mac.add_chunk(offset, &data);
-                data.freeze()
+                data
             }
         })
         .await
@@ -238,8 +237,12 @@ where
     aes_iv_16[..8].copy_from_slice(&aes_iv_8);
 
     let num_chunks = chunk_count(file_size);
-    // Cap workers to avoid spawning more than necessary; workers beyond num_chunks will be idle
-    let num_workers = num_connections.max(1).min(num_chunks as usize);
+    let requested_workers = num_connections.max(1);
+    if requested_workers > MAX_PARALLEL_WORKERS {
+        return Err(Error::ParallelismTooHigh);
+    }
+    // Cap workers so we never exceed the number of chunks or the configured maximum
+    let num_workers = requested_workers.min(num_chunks as usize);
     let next_chunk = Arc::new(AtomicU64::new(0));
 
     // Channel: downloaders → processor
