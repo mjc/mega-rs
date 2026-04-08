@@ -928,64 +928,18 @@ impl Client {
                                 continue;
                             };
 
-                            let Some(mut file_key) = file_key.split('/').find_map(|key| {
+                            let Some((_file_key, aes_key, aes_iv, condensed_mac, attrs)) =
+                                file_key.split('/').find_map(|key| {
                                 let (_, file_key) = key.split_once(':')?;
-
-                                if file_key.len() >= 44 {
-                                    // Keys bigger than this size are using RSA instead of AES.
-                                    // We don't support this as of right now.
-                                    todo!();
-                                }
-
-                                let mut file_key = BASE64_URL_SAFE_NO_PAD.decode(file_key).ok()?;
-
-                                // File keys are 32 bytes and folder keys are 16 bytes.
-                                // Other sizes are considered invalid.
-                                if (file.kind.is_file() && file_key.len() != FILE_KEY_SIZE)
-                                    || (!file.kind.is_file() && file_key.len() != FOLDER_KEY_SIZE)
-                                {
-                                    return None;
-                                }
-
-                                // TODO: MEGA includes in its web client a check to see if both halves of `file_key`
-                                //       are identical to each other. This is apparently done to prevent an attacker from
-                                //       being able to produce an all-zeroes AES key (by XOR-ing the two halves after EBC decryption).
-                                //       It's a bit unclear what we should do in our specific case, so it isn't yet implemented here.
-                                //
-                                //       Here would be how to implement such a check:
-                                //       ```
-                                //       if !self.state.allow_null_keys {
-                                //           let (fst, snd) = file_key.split_at(16);
-                                //           if fst == snd {
-                                //               return None;
-                                //           }
-                                //       }
-                                //       ```
-
-                                utils::decrypt_ebc_in_place(&node_key, &mut file_key);
-                                Some(file_key)
-                            }) else {
-                                continue;
-                            };
-
-                            let (aes_key, aes_iv, condensed_mac) = if file.kind.is_file() {
-                                utils::unmerge_key_mac(&mut file_key);
-
-                                let (aes_key, rest) = file_key.split_at(16);
-                                let (aes_iv, condensed_mac) = rest.split_at(8);
-
-                                (
-                                    aes_key.try_into().unwrap(),
-                                    aes_iv.try_into().ok(),
-                                    condensed_mac.try_into().ok(),
+                                decode_public_node_with_attrs(
+                                    file.kind,
+                                    file_key,
+                                    &file.attr,
+                                    &node_key,
                                 )
-                            } else {
-                                (file_key.try_into().unwrap(), None, None)
-                            };
-
-                            let attrs = {
-                                let mut buffer = BASE64_URL_SAFE_NO_PAD.decode(&file.attr)?;
-                                NodeAttributes::decrypt_and_unpack(&aes_key, buffer.as_mut_slice())?
+                            })
+                            else {
+                                continue;
                             };
 
                             let (thumbnail_handle, preview_image_handle) = file
@@ -2127,6 +2081,57 @@ impl Client {
     }
 }
 
+fn unpack_node_key(
+    node_kind: NodeKind,
+    mut file_key: Vec<u8>,
+) -> Option<(Vec<u8>, [u8; 16], Option<[u8; 8]>, Option<[u8; 8]>)> {
+    if (node_kind.is_file() && file_key.len() != FILE_KEY_SIZE)
+        || (!node_kind.is_file() && file_key.len() != FOLDER_KEY_SIZE)
+    {
+        return None;
+    }
+
+    if node_kind.is_file() {
+        utils::unmerge_key_mac(&mut file_key);
+
+        let (aes_key, rest) = file_key.split_at(16);
+        let (aes_iv, condensed_mac) = rest.split_at(8);
+        let aes_key: [u8; 16] = aes_key.try_into().unwrap();
+        let aes_iv: [u8; 8] = aes_iv.try_into().unwrap();
+        let condensed_mac: [u8; 8] = condensed_mac.try_into().unwrap();
+
+        Some((
+            file_key,
+            aes_key,
+            Some(aes_iv),
+            Some(condensed_mac),
+        ))
+    } else {
+        Some((file_key.clone(), file_key.try_into().unwrap(), None, None))
+    }
+}
+
+fn decode_public_node_with_attrs(
+    node_kind: NodeKind,
+    encrypted_key: &str,
+    encrypted_attr: &str,
+    folder_key: &[u8],
+) -> Option<(Vec<u8>, [u8; 16], Option<[u8; 8]>, Option<[u8; 8]>, NodeAttributes)> {
+    if encrypted_key.len() >= 44 {
+        return None;
+    }
+
+    let mut file_key = BASE64_URL_SAFE_NO_PAD.decode(encrypted_key).ok()?;
+    utils::decrypt_ebc_in_place(folder_key, &mut file_key);
+
+    let (file_key, aes_key, aes_iv, condensed_mac) = unpack_node_key(node_kind, file_key)?;
+
+    let mut buffer = BASE64_URL_SAFE_NO_PAD.decode(encrypted_attr).ok()?;
+    let attrs = NodeAttributes::decrypt_and_unpack(&aes_key, buffer.as_mut_slice()).ok()?;
+
+    Some((file_key, aes_key, aes_iv, condensed_mac, attrs))
+}
+
 fn construct_event_node(
     session: &UserSession,
     nodes: &Nodes,
@@ -2921,4 +2926,58 @@ pub struct UserInfo {
     pub birth_date: Option<NaiveDate>,
     /// The country code of the user.
     pub country_code: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn public_folder_key_selection_uses_fragment_that_decrypts_attrs() {
+        fn encrypt_ebc(key: &[u8; 16], data: &mut [u8]) {
+            let mut aes = Aes128::new(key.into());
+            for block in data.chunks_mut(16) {
+                aes.encrypt_block_mut(block.into());
+            }
+        }
+
+        let folder_key = [0x11; 16];
+        let good_plain_key = [0x22; 16];
+        let bad_plain_key = [0x33; 16];
+        let attrs = NodeAttributes {
+            name: "ok".to_string(),
+            fingerprint: None,
+            modified_at: None,
+            other: HashMap::new(),
+        };
+        let encrypted_attr = BASE64_URL_SAFE_NO_PAD.encode(attrs.pack_and_encrypt(&good_plain_key).unwrap());
+
+        let mut good_key = good_plain_key.to_vec();
+        encrypt_ebc(&folder_key, &mut good_key);
+        let good_key = BASE64_URL_SAFE_NO_PAD.encode(good_key);
+
+        let mut bad_key = bad_plain_key.to_vec();
+        encrypt_ebc(&folder_key, &mut bad_key);
+        let bad_key = BASE64_URL_SAFE_NO_PAD.encode(bad_key);
+
+        assert!(
+            decode_public_node_with_attrs(
+                NodeKind::Folder,
+                &bad_key,
+                &encrypted_attr,
+                &folder_key,
+            )
+            .is_none(),
+            "wrong fragment should be rejected instead of poisoning the whole folder fetch",
+        );
+
+        let (_, _, _, _, decoded_attrs) = decode_public_node_with_attrs(
+            NodeKind::Folder,
+            &good_key,
+            &encrypted_attr,
+            &folder_key,
+        )
+        .expect("correct fragment should decrypt attrs");
+        assert_eq!(decoded_attrs.name, "ok");
+    }
 }
