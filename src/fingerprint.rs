@@ -7,7 +7,9 @@ use base64::prelude::{Engine, BASE64_URL_SAFE_NO_PAD};
 use cipher::{BlockEncryptMut, KeyIvInit};
 use futures::io::{AsyncRead, AsyncReadExt};
 
-use crate::{Error, Result};
+#[cfg(feature = "parallel")]
+use crate::Error;
+use crate::Result;
 
 /// Represents the node's fingerprint (useful for caching purposes).
 #[derive(Debug, Clone, PartialEq)]
