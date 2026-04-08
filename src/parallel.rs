@@ -20,10 +20,10 @@ use crate::fingerprint::{compute_condensed_mac, ParallelMacProcessor};
 use crate::http::HttpClient;
 use crate::Node;
 
-/// Download chunk size (32 MB) - larger chunks reduce HTTP overhead.
-const CHUNK_SIZE: u64 = 32 * 1024 * 1024;
+/// Download chunk size (16 MB) - larger chunks reduce HTTP overhead.
+const CHUNK_SIZE: u64 = 16 * 1024 * 1024;
 /// Maximum number of workers we will spawn to keep RAM bounded.
-const MAX_PARALLEL_WORKERS: usize = 32;
+const MAX_PARALLEL_WORKERS: usize = 16;
 
 // ============================================================================
 // Message type
