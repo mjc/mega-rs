@@ -74,6 +74,9 @@ pub enum Error {
     /// Failed to find node attribute.
     #[error("failed to find node attribute")]
     NodeAttributeNotFound,
+    /// Decrypted node attributes did not have the expected MEGA prefix.
+    #[error("invalid node attributes header")]
+    InvalidNodeAttributesHeader,
     /// Could not get a meaningful response after maximum retries.
     #[error("could not get a meaningful response after maximum retries")]
     MaxRetriesReached,

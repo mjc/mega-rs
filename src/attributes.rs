@@ -32,7 +32,9 @@ impl NodeAttributes {
             cbc.decrypt_block_mut(chunk.into());
         }
 
-        assert_eq!(&buffer[..4], b"MEGA");
+        if buffer.len() < 4 || &buffer[..4] != b"MEGA" {
+            return Err(crate::Error::InvalidNodeAttributesHeader);
+        }
 
         let len = buffer.iter().take_while(|it| **it != b'\0').count();
         let attrs = json::from_slice(&buffer[4..len])?;
