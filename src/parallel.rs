@@ -16,12 +16,13 @@ use futures::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use crate::error::{Error, Result};
-use crate::fingerprint::{compute_condensed_mac, ParallelMacProcessor};
+use crate::fingerprint::{
+    compute_condensed_mac, compute_mega_chunk_mac, mega_chunk_boundaries, MegaChunk,
+    ParallelMacProcessor,
+};
 use crate::http::HttpClient;
 use crate::Node;
 
-/// Download chunk size (16 MB) - larger chunks reduce HTTP overhead.
-const CHUNK_SIZE: u64 = 16 * 1024 * 1024;
 /// Maximum number of workers we will spawn to keep RAM bounded.
 const MAX_PARALLEL_WORKERS: usize = 16;
 
@@ -31,6 +32,7 @@ const MAX_PARALLEL_WORKERS: usize = 16;
 
 /// Downloaded chunk (encrypted, mutable for in-place decryption).
 struct DownloadedChunk {
+    index: u32,
     offset: u64,
     data: Vec<u8>,
 }
@@ -39,19 +41,7 @@ struct DownloadedChunk {
 // Chunk calculation
 // ============================================================================
 
-#[derive(Debug, Clone, Copy)]
-struct ChunkRange {
-    offset: u64,
-    length: u64,
-}
-
-impl ChunkRange {
-    fn new(index: u64, file_size: u64) -> Self {
-        let offset = index * CHUNK_SIZE;
-        let length = CHUNK_SIZE.min(file_size.saturating_sub(offset));
-        Self { offset, length }
-    }
-
+impl MegaChunk {
     fn end(&self) -> u64 {
         self.offset + self.length
     }
@@ -63,10 +53,6 @@ impl ChunkRange {
             self.end().saturating_sub(1)
         )
     }
-}
-
-fn chunk_count(file_size: u64) -> u64 {
-    file_size.div_ceil(CHUNK_SIZE)
 }
 
 // ============================================================================
@@ -85,9 +71,9 @@ fn decrypt(key: &[u8; 16], iv: &[u8; 16], offset: u64, data: &mut [u8]) {
 
 struct DownloadContext {
     base_url: String,
-    file_size: u64,
     next_chunk: Arc<AtomicU64>,
-    num_chunks: u64,
+    chunks: Arc<[MegaChunk]>,
+    trusted_chunks: Arc<[Option<[u8; 16]>]>,
     tx: mpsc::Sender<DownloadedChunk>,
     progress: Option<Arc<dyn Fn(u64) + Send + Sync>>,
     progress_total: Option<Arc<AtomicU64>>,
@@ -97,11 +83,17 @@ struct DownloadContext {
 async fn download_worker(client: &dyn HttpClient, ctx: DownloadContext) -> Result<()> {
     loop {
         let idx = ctx.next_chunk.fetch_add(1, Ordering::Relaxed);
-        if idx >= ctx.num_chunks {
+        let Some(range) = ctx.chunks.get(idx as usize).copied() else {
             break;
+        };
+        if ctx
+            .trusted_chunks
+            .get(idx as usize)
+            .is_some_and(Option::is_some)
+        {
+            continue;
         }
 
-        let range = ChunkRange::new(idx, ctx.file_size);
         let target_size = range.length as usize;
         let mut buffer = vec![0u8; target_size];
 
@@ -142,6 +134,7 @@ async fn download_worker(client: &dyn HttpClient, ctx: DownloadContext) -> Resul
         }
 
         let chunk = DownloadedChunk {
+            index: range.index,
             offset: range.offset,
             data: buffer,
         };
@@ -163,6 +156,8 @@ async fn process_chunks<W>(
     mac: Arc<ParallelMacProcessor>,
     aes_key: [u8; 16],
     aes_iv: [u8; 16],
+    aes_iv_8: [u8; 8],
+    chunk_verified: Option<Arc<dyn Fn(u32, [u8; 16]) + Send + Sync>>,
 ) -> Result<()>
 where
     W: futures::io::AsyncWrite + futures::io::AsyncSeek + Unpin,
@@ -173,11 +168,10 @@ where
         // Decrypt + MAC in single blocking task (data stays hot in cache)
         let decrypted = tokio::task::spawn_blocking({
             let mut data = chunk.data;
-            let mac = Arc::clone(&mac);
-            move || -> Result<Vec<u8>> {
+            move || -> Result<([u8; 16], Vec<u8>)> {
                 decrypt(&aes_key, &aes_iv, offset, &mut data);
-                mac.add_chunk(offset, &data)?;
-                Ok(data)
+                let chunk_mac = compute_mega_chunk_mac(&data, &aes_key, &aes_iv_8);
+                Ok((chunk_mac, data))
             }
         })
         .await
@@ -187,9 +181,16 @@ where
             )))
         })??;
 
+        let chunk_index = chunk.index;
+        let chunk_mac = decrypted.0;
+        mac.set_chunk_mac(chunk_index as usize, chunk_mac);
+
         // Write to file
         writer.seek(SeekFrom::Start(offset)).await?;
-        writer.write_all(&decrypted).await?;
+        writer.write_all(&decrypted.1).await?;
+        if let Some(ref cb) = chunk_verified {
+            cb(chunk_index, chunk_mac);
+        }
     }
 
     writer.flush().await?;
@@ -212,6 +213,39 @@ pub(crate) async fn download_parallel<W>(
     writer: W,
     num_connections: usize,
     progress_callback: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+    aes_iv: [u8; 8],
+    expected_mac: [u8; 8],
+) -> Result<()>
+where
+    W: futures::io::AsyncWrite + futures::io::AsyncSeek + Unpin + Send + 'static,
+{
+    download_parallel_resumable(
+        client,
+        node,
+        base_url,
+        server_size,
+        writer,
+        num_connections,
+        progress_callback,
+        None,
+        None,
+        aes_iv,
+        expected_mac,
+    )
+    .await
+}
+
+/// Downloads a file using parallel connections, skipping preverified plaintext chunks.
+pub(crate) async fn download_parallel_resumable<W>(
+    client: &dyn HttpClient,
+    node: &Node,
+    base_url: String,
+    server_size: u64,
+    writer: W,
+    num_connections: usize,
+    progress_callback: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+    trusted_chunks: Option<Arc<[Option<[u8; 16]>]>>,
+    chunk_verified: Option<Arc<dyn Fn(u32, [u8; 16]) + Send + Sync>>,
     aes_iv: [u8; 8],
     expected_mac: [u8; 8],
 ) -> Result<()>
@@ -245,13 +279,60 @@ where
     let mut aes_iv_16 = [0u8; 16];
     aes_iv_16[..8].copy_from_slice(&aes_iv_8);
 
-    let num_chunks = chunk_count(file_size);
+    let chunks = Arc::<[MegaChunk]>::from(mega_chunk_boundaries(file_size));
+    let num_chunks = chunks.len() as u64;
+    let trusted_chunks = trusted_chunks.unwrap_or_else(|| {
+        std::iter::repeat_with(|| None)
+            .take(num_chunks as usize)
+            .collect::<Vec<_>>()
+            .into()
+    });
+    let trusted_bytes = chunks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, chunk)| {
+            trusted_chunks
+                .get(index)
+                .and_then(Option::as_ref)
+                .map(|_| chunk.length)
+        })
+        .sum::<u64>();
     let requested_workers = num_connections.max(1);
     if requested_workers > MAX_PARALLEL_WORKERS {
         return Err(Error::ParallelismTooHigh);
     }
+    let untrusted_chunks = num_chunks as usize
+        - trusted_chunks
+            .iter()
+            .take(num_chunks as usize)
+            .filter(|entry| entry.is_some())
+            .count();
+
+    // MAC processor (handles out-of-order chunks)
+    let mac = Arc::new(ParallelMacProcessor::new(file_size, &aes_key, &aes_iv_8));
+    for (index, entry) in trusted_chunks.iter().take(num_chunks as usize).enumerate() {
+        if let Some(chunk_mac) = entry {
+            mac.set_chunk_mac(index, *chunk_mac);
+        }
+    }
+
+    let progress: Option<Arc<dyn Fn(u64) + Send + Sync>> = progress_callback;
+    if trusted_bytes > 0 {
+        if let Some(ref cb) = progress {
+            cb(trusted_bytes);
+        }
+    }
+    if untrusted_chunks == 0 {
+        let computed_mac = mac.finalize().ok_or(Error::CondensedMacMismatch)?;
+        return if computed_mac == expected_mac {
+            Ok(())
+        } else {
+            Err(Error::CondensedMacMismatch)
+        };
+    }
+
     // Cap workers so we never exceed the number of chunks or the configured maximum
-    let num_workers = requested_workers.min(num_chunks as usize);
+    let num_workers = requested_workers.min(untrusted_chunks);
     let next_chunk = Arc::new(AtomicU64::new(0));
 
     // Channel: downloaders → processor
@@ -260,29 +341,37 @@ where
     // in-flight downloads, i.e. ~2 * num_workers * CHUNK_SIZE total.
     let (tx, rx) = mpsc::channel::<DownloadedChunk>(num_workers);
 
-    // MAC processor (handles out-of-order chunks)
-    let mac = Arc::new(ParallelMacProcessor::new(file_size, &aes_key, &aes_iv_8));
-
     // Progress callback with cumulative tracking and monotonic reporting
-    let progress: Option<Arc<dyn Fn(u64) + Send + Sync>> = progress_callback;
-    let progress_total = progress.as_ref().map(|_| Arc::new(AtomicU64::new(0)));
-    let progress_reported = progress.as_ref().map(|_| Arc::new(AtomicU64::new(0)));
+    let progress_total = progress
+        .as_ref()
+        .map(|_| Arc::new(AtomicU64::new(trusted_bytes)));
+    let progress_reported = progress
+        .as_ref()
+        .map(|_| Arc::new(AtomicU64::new(trusted_bytes)));
 
     // Processor task: decrypt, write, MAC
     let processor_mac = Arc::clone(&mac);
-    let processor_handle =
-        tokio::spawn(
-            async move { process_chunks(rx, writer, processor_mac, aes_key, aes_iv_16).await },
-        );
+    let processor_handle = tokio::spawn(async move {
+        process_chunks(
+            rx,
+            writer,
+            processor_mac,
+            aes_key,
+            aes_iv_16,
+            aes_iv_8,
+            chunk_verified,
+        )
+        .await
+    });
 
     // Download workers
     let download_workers: Vec<_> = (0..num_workers)
         .map(|_| {
             let ctx = DownloadContext {
                 base_url: base_url.clone(),
-                file_size,
                 next_chunk: Arc::clone(&next_chunk),
-                num_chunks,
+                chunks: Arc::clone(&chunks),
+                trusted_chunks: Arc::clone(&trusted_chunks),
                 tx: tx.clone(),
                 progress: progress.clone(),
                 progress_total: progress_total.clone(),
@@ -334,35 +423,33 @@ mod tests {
 
     #[test]
     fn chunk_range_basic() {
-        let r = ChunkRange::new(0, 500);
+        let chunks = mega_chunk_boundaries(500);
+        let r = chunks[0];
         assert_eq!(r.offset, 0);
         assert_eq!(r.length, 500);
     }
 
     #[test]
     fn chunk_range_large_file() {
-        let file_size = 100 * 1024 * 1024; // 100 MB
-        let num_chunks = chunk_count(file_size);
-        assert_eq!(num_chunks, 4); // 32MB + 32MB + 32MB + 4MB
-        assert_eq!(ChunkRange::new(0, file_size).length, CHUNK_SIZE);
-        assert_eq!(ChunkRange::new(1, file_size).length, CHUNK_SIZE);
-        assert_eq!(
-            ChunkRange::new(3, file_size).length,
-            file_size - 3 * CHUNK_SIZE
-        );
+        let chunks = mega_chunk_boundaries(1280 * 1024);
+        assert_eq!(chunks.len(), 4);
+        assert_eq!(chunks[0].length, 128 * 1024);
+        assert_eq!(chunks[1].length, 256 * 1024);
+        assert_eq!(chunks[2].length, 384 * 1024);
+        assert_eq!(chunks[3].length, 512 * 1024);
     }
 
     #[test]
     fn chunk_range_past_end() {
-        assert_eq!(ChunkRange::new(10, 500).length, 0);
+        assert!(mega_chunk_boundaries(500).get(10).is_none());
     }
 
     #[test]
     fn chunk_count_cases() {
-        assert_eq!(chunk_count(0), 0);
-        assert_eq!(chunk_count(1), 1);
-        assert_eq!(chunk_count(CHUNK_SIZE), 1);
-        assert_eq!(chunk_count(CHUNK_SIZE + 1), 2);
+        assert_eq!(mega_chunk_boundaries(0).len(), 0);
+        assert_eq!(mega_chunk_boundaries(1).len(), 1);
+        assert_eq!(mega_chunk_boundaries(128 * 1024).len(), 1);
+        assert_eq!(mega_chunk_boundaries(128 * 1024 + 1).len(), 2);
     }
 
     #[test]

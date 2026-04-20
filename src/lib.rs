@@ -28,10 +28,12 @@ mod sessions;
 mod utils;
 
 pub use crate::error::{Error, ErrorCode, Result};
-#[cfg(feature = "parallel")]
-pub use crate::fingerprint::ParallelMacProcessor;
 pub use crate::fingerprint::{
     compute_condensed_mac, compute_condensed_mac_from_buffer, compute_sparse_checksum,
+};
+#[cfg(feature = "parallel")]
+pub use crate::fingerprint::{
+    compute_mega_chunk_mac, mega_chunk_boundaries, MegaChunk, ParallelMacProcessor,
 };
 pub use crate::protocol::commands::{FileNode, NodeKind};
 pub use crate::sessions::SessionInfo;
@@ -930,14 +932,11 @@ impl Client {
 
                             let Some((_file_key, aes_key, aes_iv, condensed_mac, attrs)) =
                                 file_key.split('/').find_map(|key| {
-                                let (_, file_key) = key.split_once(':')?;
-                                decode_public_node_with_attrs(
-                                    file.kind,
-                                    file_key,
-                                    &file.attr,
-                                    &node_key,
-                                )
-                            })
+                                    let (_, file_key) = key.split_once(':')?;
+                                    decode_public_node_with_attrs(
+                                        file.kind, file_key, &file.attr, &node_key,
+                                    )
+                                })
                             else {
                                 continue;
                             };
@@ -1332,6 +1331,57 @@ impl Client {
             writer,
             num_connections,
             progress,
+            aes_iv,
+            expected_mac,
+        )
+        .await
+    }
+
+    /// Downloads a file using multiple parallel connections, skipping
+    /// prevalidated plaintext MEGA chunks.
+    ///
+    /// `trusted_chunks` is a dense chunk-indexed slice. Entries set to `Some`
+    /// contain the already verified plaintext chunk MAC and are not fetched or
+    /// written. Missing entries are downloaded, decrypted in memory, written as
+    /// plaintext, and reported through `chunk_verified` after their MAC is
+    /// computed.
+    #[cfg(feature = "parallel")]
+    pub async fn download_node_parallel_resumable_with_progress<W, F, C>(
+        &self,
+        node: &Node,
+        writer: W,
+        num_connections: usize,
+        trusted_chunks: &[Option<[u8; 16]>],
+        progress: Option<F>,
+        chunk_verified: Option<C>,
+    ) -> Result<()>
+    where
+        W: futures::io::AsyncWrite + futures::io::AsyncSeek + Unpin + Send + 'static,
+        F: Fn(u64) + Send + Sync + 'static,
+        C: Fn(u32, [u8; 16]) + Send + Sync + 'static,
+    {
+        if !node.kind.is_file() {
+            return Err(Error::NotAFileNode);
+        }
+
+        let aes_iv = node.aes_iv.ok_or(Error::MissingNodeAesIv)?;
+        let expected_mac = node.condensed_mac.ok_or(Error::MissingCondensedMac)?;
+
+        let (base_url, server_size) = self.get_download_url(node).await?;
+        let progress = progress.map(|cb| Arc::new(cb) as Arc<dyn Fn(u64) + Send + Sync>);
+        let trusted_chunks: Arc<[Option<[u8; 16]>]> = trusted_chunks.to_vec().into();
+        let chunk_verified =
+            chunk_verified.map(|cb| Arc::new(cb) as Arc<dyn Fn(u32, [u8; 16]) + Send + Sync>);
+        parallel::download_parallel_resumable(
+            &*self.client,
+            node,
+            base_url,
+            server_size,
+            writer,
+            num_connections,
+            progress,
+            Some(trusted_chunks),
+            chunk_verified,
             aes_iv,
             expected_mac,
         )
@@ -2100,12 +2150,7 @@ fn unpack_node_key(
         let aes_iv: [u8; 8] = aes_iv.try_into().unwrap();
         let condensed_mac: [u8; 8] = condensed_mac.try_into().unwrap();
 
-        Some((
-            file_key,
-            aes_key,
-            Some(aes_iv),
-            Some(condensed_mac),
-        ))
+        Some((file_key, aes_key, Some(aes_iv), Some(condensed_mac)))
     } else {
         Some((file_key.clone(), file_key.try_into().unwrap(), None, None))
     }
@@ -2116,7 +2161,13 @@ fn decode_public_node_with_attrs(
     encrypted_key: &str,
     encrypted_attr: &str,
     folder_key: &[u8],
-) -> Option<(Vec<u8>, [u8; 16], Option<[u8; 8]>, Option<[u8; 8]>, NodeAttributes)> {
+) -> Option<(
+    Vec<u8>,
+    [u8; 16],
+    Option<[u8; 8]>,
+    Option<[u8; 8]>,
+    NodeAttributes,
+)> {
     if encrypted_key.len() >= 44 {
         return None;
     }
@@ -2950,7 +3001,8 @@ mod tests {
             modified_at: None,
             other: HashMap::new(),
         };
-        let encrypted_attr = BASE64_URL_SAFE_NO_PAD.encode(attrs.pack_and_encrypt(&good_plain_key).unwrap());
+        let encrypted_attr =
+            BASE64_URL_SAFE_NO_PAD.encode(attrs.pack_and_encrypt(&good_plain_key).unwrap());
 
         let mut good_key = good_plain_key.to_vec();
         encrypt_ebc(&folder_key, &mut good_key);

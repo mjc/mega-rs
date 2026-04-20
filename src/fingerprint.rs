@@ -290,11 +290,49 @@ pub async fn compute_condensed_mac<R: AsyncRead>(
 }
 
 /// Pre-computed chunk boundary info for O(1) lookups
-#[cfg(feature = "parallel")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MegaChunk {
+    pub index: u32,
+    pub offset: u64,
+    pub length: u64,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ChunkInfo {
     start: u64,
     size: u64,
+}
+
+fn build_chunk_boundaries(file_size: u64) -> Vec<ChunkInfo> {
+    let mut boundaries = Vec::new();
+    let mut offset = 0u64;
+    let mut size = 131_072u64;
+    while offset < file_size {
+        let actual_size = size.min(file_size - offset);
+        boundaries.push(ChunkInfo {
+            start: offset,
+            size: actual_size,
+        });
+        offset += actual_size;
+        if size < 1_048_576 {
+            size += 131_072;
+        }
+    }
+    boundaries
+}
+
+/// Returns the plaintext MAC chunk boundaries MEGA uses for a file size.
+#[must_use]
+pub fn mega_chunk_boundaries(file_size: u64) -> Vec<MegaChunk> {
+    build_chunk_boundaries(file_size)
+        .into_iter()
+        .enumerate()
+        .map(|(index, info)| MegaChunk {
+            index: index as u32,
+            offset: info.start,
+            length: info.size,
+        })
+        .collect()
 }
 
 /// A parallel MAC processor that computes MEGA chunk MACs independently.
@@ -394,24 +432,8 @@ impl ParallelMacProcessor {
             iv
         };
 
-        // Pre-compute all chunk boundaries
-        let chunk_boundaries = {
-            let mut boundaries = Vec::new();
-            let mut offset = 0u64;
-            let mut size = 131_072u64;
-            while offset < file_size {
-                let actual_size = size.min(file_size - offset);
-                boundaries.push(ChunkInfo {
-                    start: offset,
-                    size: actual_size,
-                });
-                offset += actual_size;
-                if size < 1_048_576 {
-                    size += 131_072;
-                }
-            }
-            boundaries.into_boxed_slice()
-        };
+        // Pre-compute all chunk boundaries.
+        let chunk_boundaries = build_chunk_boundaries(file_size).into_boxed_slice();
 
         let num_chunks = chunk_boundaries.len();
         Self {
@@ -461,6 +483,23 @@ impl ParallelMacProcessor {
             Err(poisoned) => poisoned.into_inner(),
         }
     }
+
+    /// Seeds a preverified MEGA chunk MAC for resumable downloads.
+    ///
+    /// Returns false if `index` is outside the file's MEGA chunk list.
+    pub fn set_chunk_mac(&self, index: usize, mac: [u8; 16]) -> bool {
+        let Some(entry) = self.chunk_macs.get(index) else {
+            return false;
+        };
+        entry.store(mac);
+        true
+    }
+
+    /// Returns a computed MEGA chunk MAC, if available.
+    #[must_use]
+    pub fn chunk_mac(&self, index: usize) -> Option<[u8; 16]> {
+        self.chunk_macs.get(index).and_then(MacEntry::load)
+    }
 }
 
 /// Standalone MAC computation for use with spawn_blocking
@@ -481,6 +520,19 @@ fn compute_chunk_mac_inner(aes_key: &[u8; 16], aes_iv: &[u8; 16], data: &[u8]) -
     }
 
     cur_mac
+}
+
+/// Computes a single MEGA plaintext chunk MAC.
+#[cfg(feature = "parallel")]
+#[must_use]
+pub fn compute_mega_chunk_mac(data: &[u8], aes_key: &[u8; 16], aes_iv: &[u8; 8]) -> [u8; 16] {
+    let aes_iv_full = {
+        let mut iv = [0u8; 16];
+        iv[..8].copy_from_slice(aes_iv);
+        iv[8..].copy_from_slice(aes_iv);
+        iv
+    };
+    compute_chunk_mac_inner(aes_key, &aes_iv_full, data)
 }
 
 #[cfg(feature = "parallel")]
