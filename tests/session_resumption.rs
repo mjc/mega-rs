@@ -6,7 +6,10 @@ use std::env;
 
 #[tokio::test]
 async fn session_resumption() {
-    let session = env::var("MEGA_SESSION").expect("missing MEGA_SESSION environment variable");
+    let Ok(session) = env::var("MEGA_SESSION") else {
+        eprintln!("skipping session_resumption: missing MEGA_SESSION environment variable");
+        return;
+    };
 
     let http_client = reqwest::Client::new();
     let mut mega = mega::Client::builder().build(http_client).unwrap();

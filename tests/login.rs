@@ -6,8 +6,14 @@ use std::env;
 
 #[tokio::test]
 async fn login_and_logout_test() {
-    let email = env::var("MEGA_EMAIL").expect("missing MEGA_EMAIL environment variable");
-    let password = env::var("MEGA_PASSWORD").expect("missing MEGA_PASSWORD environment variable");
+    let Ok(email) = env::var("MEGA_EMAIL") else {
+        eprintln!("skipping login_and_logout_test: missing MEGA_EMAIL environment variable");
+        return;
+    };
+    let Ok(password) = env::var("MEGA_PASSWORD") else {
+        eprintln!("skipping login_and_logout_test: missing MEGA_PASSWORD environment variable");
+        return;
+    };
     let mfa = env::var("MEGA_MFA").ok();
 
     let http_client = reqwest::Client::new();
