@@ -237,6 +237,7 @@ async fn process_chunks<W>(
 where
     W: ParallelDownloadWriter,
 {
+    let mut durability_available = chunk_verified.is_some();
     while let Some(chunk) = rx.recv().await {
         let offset = chunk.offset;
 
@@ -263,10 +264,18 @@ where
         // Write to file
         writer.seek(SeekFrom::Start(offset)).await?;
         writer.write_all(&decrypted.1).await?;
-        if let Some(ref cb) = chunk_verified {
+        if durability_available {
             writer.flush().await?;
-            writer.sync_data().await?;
-            cb(chunk_index, chunk_mac);
+            match writer.sync_data().await {
+                Ok(()) => {
+                    if let Some(ref cb) = chunk_verified {
+                        cb(chunk_index, chunk_mac);
+                    }
+                }
+                Err(_) => {
+                    durability_available = false;
+                }
+            }
         }
     }
 
@@ -1066,7 +1075,7 @@ mod tests {
         .unwrap();
         drop(tx);
 
-        let err = process_chunks(
+        process_chunks(
             rx,
             writer.clone(),
             mac,
@@ -1078,9 +1087,9 @@ mod tests {
             })),
         )
         .await
-        .unwrap_err();
+        .unwrap();
 
-        assert!(err.to_string().contains("simulated sync failure"));
+        assert_eq!(writer.bytes(), plaintext);
         assert_eq!(*callback_count.lock().unwrap(), 0);
     }
 }
