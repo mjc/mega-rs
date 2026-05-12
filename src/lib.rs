@@ -35,6 +35,8 @@ pub use crate::fingerprint::{
 pub use crate::fingerprint::{
     compute_mega_chunk_mac, mega_chunk_boundaries, MegaChunk, ParallelMacProcessor,
 };
+#[cfg(feature = "parallel")]
+pub use crate::parallel::ParallelDownloadWriter;
 pub use crate::protocol::commands::{FileNode, NodeKind};
 pub use crate::sessions::SessionInfo;
 pub use crate::utils::StorageQuotas;
@@ -1343,8 +1345,8 @@ impl Client {
     /// `trusted_chunks` is a dense chunk-indexed slice. Entries set to `Some`
     /// contain the already verified plaintext chunk MAC and are not fetched or
     /// written. Missing entries are downloaded, decrypted in memory, written as
-    /// plaintext, and reported through `chunk_verified` after their MAC is
-    /// computed.
+    /// plaintext, and reported through `chunk_verified` only after the chunk
+    /// has been written, flushed, and durably synced through the writer.
     #[cfg(feature = "parallel")]
     pub async fn download_node_parallel_resumable_with_progress<W, F, C>(
         &self,
@@ -1356,7 +1358,7 @@ impl Client {
         chunk_verified: Option<C>,
     ) -> Result<()>
     where
-        W: futures::io::AsyncWrite + futures::io::AsyncSeek + Unpin + Send + 'static,
+        W: ParallelDownloadWriter + 'static,
         F: Fn(u64) + Send + Sync + 'static,
         C: Fn(u32, [u8; 16]) + Send + Sync + 'static,
     {

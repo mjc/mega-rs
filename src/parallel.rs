@@ -6,10 +6,12 @@
 //! - Uses ParallelMacProcessor for out-of-order MAC computation
 
 use std::io::SeekFrom;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use aes::Aes128;
+use async_trait::async_trait;
 use cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
 use futures::io::Cursor;
 use futures::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -25,6 +27,79 @@ use crate::Node;
 
 /// Maximum number of workers we will spawn to keep RAM bounded.
 const MAX_PARALLEL_WORKERS: usize = 16;
+
+#[async_trait]
+pub trait ParallelDownloadWriter:
+    futures::io::AsyncWrite + futures::io::AsyncSeek + Unpin + Send
+{
+    async fn sync_data(&mut self) -> std::io::Result<()>;
+}
+
+#[cfg(feature = "reqwest")]
+#[async_trait]
+impl ParallelDownloadWriter for tokio_util::compat::Compat<tokio::fs::File> {
+    async fn sync_data(&mut self) -> std::io::Result<()> {
+        self.get_mut().sync_data().await
+    }
+}
+
+struct NoSyncWriter<W>(W);
+
+impl<W> NoSyncWriter<W> {
+    fn new(writer: W) -> Self {
+        Self(writer)
+    }
+}
+
+impl<W> futures::io::AsyncWrite for NoSyncWriter<W>
+where
+    W: futures::io::AsyncWrite + Unpin,
+{
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().0).poll_flush(cx)
+    }
+
+    fn poll_close(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().0).poll_close(cx)
+    }
+}
+
+impl<W> futures::io::AsyncSeek for NoSyncWriter<W>
+where
+    W: futures::io::AsyncSeek + Unpin,
+{
+    fn poll_seek(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        pos: SeekFrom,
+    ) -> std::task::Poll<std::io::Result<u64>> {
+        Pin::new(&mut self.get_mut().0).poll_seek(cx, pos)
+    }
+}
+
+#[async_trait]
+impl<W> ParallelDownloadWriter for NoSyncWriter<W>
+where
+    W: futures::io::AsyncWrite + futures::io::AsyncSeek + Unpin + Send,
+{
+    async fn sync_data(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 // ============================================================================
 // Message type
@@ -160,7 +235,7 @@ async fn process_chunks<W>(
     chunk_verified: Option<Arc<dyn Fn(u32, [u8; 16]) + Send + Sync>>,
 ) -> Result<()>
 where
-    W: futures::io::AsyncWrite + futures::io::AsyncSeek + Unpin,
+    W: ParallelDownloadWriter,
 {
     while let Some(chunk) = rx.recv().await {
         let offset = chunk.offset;
@@ -189,6 +264,8 @@ where
         writer.seek(SeekFrom::Start(offset)).await?;
         writer.write_all(&decrypted.1).await?;
         if let Some(ref cb) = chunk_verified {
+            writer.flush().await?;
+            writer.sync_data().await?;
             cb(chunk_index, chunk_mac);
         }
     }
@@ -224,7 +301,7 @@ where
         node,
         base_url,
         server_size,
-        writer,
+        NoSyncWriter::new(writer),
         num_connections,
         progress_callback,
         None,
@@ -250,7 +327,7 @@ pub(crate) async fn download_parallel_resumable<W>(
     expected_mac: [u8; 8],
 ) -> Result<()>
 where
-    W: futures::io::AsyncWrite + futures::io::AsyncSeek + Unpin + Send + 'static,
+    W: ParallelDownloadWriter + 'static,
 {
     if !node.kind.is_file() {
         return Err(Error::NotAFileNode);
@@ -420,6 +497,17 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+    use std::pin::Pin;
+    use std::sync::Mutex;
+    use std::task::{Context, Poll};
+
+    use async_trait::async_trait;
+    use futures::io::{AsyncRead, AsyncSeek, AsyncWrite};
+    use url::Url;
+
+    use crate::http::{ClientState, HttpClient};
+    use crate::protocol::commands::{Request, Response};
 
     #[test]
     fn chunk_range_basic() {
@@ -479,5 +567,520 @@ mod tests {
 
         assert_eq!(&whole[..32], &part1[..]);
         assert_eq!(&whole[32..], &part2[..]);
+    }
+
+    #[derive(Clone, Default)]
+    struct SharedWriter {
+        inner: Arc<Mutex<SharedWriterInner>>,
+    }
+
+    #[derive(Default)]
+    struct SharedWriterInner {
+        data: Vec<u8>,
+        pos: u64,
+        fail_sync: bool,
+        sync_calls: usize,
+        journal: Vec<&'static str>,
+    }
+
+    impl SharedWriter {
+        fn with_data(data: Vec<u8>) -> Self {
+            Self {
+                inner: Arc::new(Mutex::new(SharedWriterInner {
+                    data,
+                    pos: 0,
+                    ..SharedWriterInner::default()
+                })),
+            }
+        }
+
+        fn bytes(&self) -> Vec<u8> {
+            self.inner.lock().unwrap().data.clone()
+        }
+
+        fn set_fail_sync(&self, fail_sync: bool) {
+            self.inner.lock().unwrap().fail_sync = fail_sync;
+        }
+
+        fn sync_calls(&self) -> usize {
+            self.inner.lock().unwrap().sync_calls
+        }
+
+        fn journal(&self) -> Vec<&'static str> {
+            self.inner.lock().unwrap().journal.clone()
+        }
+    }
+
+    impl AsyncWrite for SharedWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let mut inner = self.inner.lock().unwrap();
+            let pos = usize::try_from(inner.pos).map_err(std::io::Error::other)?;
+            let end = pos
+                .checked_add(buf.len())
+                .ok_or_else(|| std::io::Error::other("write position overflow"))?;
+            if inner.data.len() < end {
+                inner.data.resize(end, 0);
+            }
+            inner.data[pos..end].copy_from_slice(buf);
+            inner.pos = end as u64;
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            self.get_mut().inner.lock().unwrap().journal.push("flush");
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncSeek for SharedWriter {
+        fn poll_seek(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            pos: SeekFrom,
+        ) -> Poll<std::io::Result<u64>> {
+            let mut inner = self.inner.lock().unwrap();
+            let len = inner.data.len() as i128;
+            let current = i128::from(inner.pos);
+            let next = match pos {
+                SeekFrom::Start(pos) => i128::from(pos),
+                SeekFrom::End(offset) => len + i128::from(offset),
+                SeekFrom::Current(offset) => current + i128::from(offset),
+            };
+            if next < 0 || next > i128::from(u64::MAX) {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "invalid seek",
+                )));
+            }
+            inner.pos = next as u64;
+            Poll::Ready(Ok(inner.pos))
+        }
+    }
+
+    #[async_trait]
+    impl ParallelDownloadWriter for SharedWriter {
+        async fn sync_data(&mut self) -> std::io::Result<()> {
+            let mut inner = self.inner.lock().unwrap();
+            inner.journal.push("sync");
+            inner.sync_calls += 1;
+            if inner.fail_sync {
+                return Err(std::io::Error::other("simulated sync failure"));
+            }
+            Ok(())
+        }
+    }
+
+    struct MockHttpClient {
+        encrypted: Vec<u8>,
+        requests: Arc<Mutex<Vec<(u64, u64)>>>,
+    }
+
+    impl MockHttpClient {
+        fn new(encrypted: Vec<u8>) -> Self {
+            Self {
+                encrypted,
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn requests(&self) -> Vec<(u64, u64)> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl HttpClient for MockHttpClient {
+        async fn send_requests(
+            &self,
+            _state: &ClientState,
+            _requests: &[Request],
+            _query_params: &[(&str, &str)],
+        ) -> Result<Vec<Response>> {
+            unreachable!("resumable tests call the lower-level downloader directly")
+        }
+
+        async fn get(&self, url: Url) -> Result<Pin<Box<dyn AsyncRead + Send>>> {
+            let range = url
+                .path_segments()
+                .and_then(Iterator::last)
+                .ok_or_else(|| std::io::Error::other("missing range"))?;
+            let (start, end) = range
+                .split_once('-')
+                .ok_or_else(|| std::io::Error::other("bad range"))?;
+            let start = start.parse::<u64>().map_err(std::io::Error::other)?;
+            let end = end.parse::<u64>().map_err(std::io::Error::other)?;
+            self.requests.lock().unwrap().push((start, end));
+            let start_usize = usize::try_from(start).map_err(std::io::Error::other)?;
+            let end_usize = usize::try_from(end).map_err(std::io::Error::other)?;
+            let bytes = self.encrypted[start_usize..=end_usize].to_vec();
+            Ok(Box::pin(Cursor::new(bytes)))
+        }
+
+        async fn post(
+            &self,
+            _url: Url,
+            _body: Pin<Box<dyn AsyncRead + Send + Sync>>,
+            _content_length: Option<u64>,
+        ) -> Result<Pin<Box<dyn AsyncRead + Send>>> {
+            unreachable!("resumable tests do not upload data")
+        }
+    }
+
+    fn test_plaintext(size: usize) -> Vec<u8> {
+        (0..size)
+            .map(|i| u8::try_from((i * 31 + 7) % 251).unwrap())
+            .collect()
+    }
+
+    fn encrypt_plaintext(plaintext: &[u8], aes_key: &[u8; 16], aes_iv: &[u8; 8]) -> Vec<u8> {
+        let mut encrypted = plaintext.to_vec();
+        let mut iv = [0u8; 16];
+        iv[..8].copy_from_slice(aes_iv);
+        decrypt(aes_key, &iv, 0, &mut encrypted);
+        encrypted
+    }
+
+    fn test_node(size: u64, aes_key: [u8; 16], aes_iv: [u8; 8], condensed_mac: [u8; 8]) -> Node {
+        Node {
+            name: "test.bin".to_string(),
+            handle: "handle".to_string(),
+            owner: "owner".to_string(),
+            size,
+            kind: crate::NodeKind::File,
+            parent: None,
+            children: Vec::new(),
+            aes_key,
+            aes_iv: Some(aes_iv),
+            condensed_mac: Some(condensed_mac),
+            sparse_checksum: None,
+            created_at: None,
+            modified_at: None,
+            download_id: None,
+            thumbnail_handle: None,
+            preview_image_handle: None,
+        }
+    }
+
+    struct ResumableFixture {
+        plaintext: Vec<u8>,
+        encrypted: Vec<u8>,
+        node: Node,
+        chunks: Vec<MegaChunk>,
+    }
+
+    fn resumable_fixture(size: usize) -> ResumableFixture {
+        let aes_key = [0x42; 16];
+        let aes_iv = [0x24; 8];
+        let plaintext = test_plaintext(size);
+        let condensed_mac = crate::fingerprint::compute_condensed_mac_from_buffer(
+            &plaintext,
+            size as u64,
+            &aes_key,
+            &aes_iv,
+        )
+        .unwrap();
+        let encrypted = encrypt_plaintext(&plaintext, &aes_key, &aes_iv);
+        let node = test_node(size as u64, aes_key, aes_iv, condensed_mac);
+        let chunks = mega_chunk_boundaries(size as u64);
+        ResumableFixture {
+            plaintext,
+            encrypted,
+            node,
+            chunks,
+        }
+    }
+
+    fn trusted_chunk_macs(
+        fixture: &ResumableFixture,
+        trusted_indices: &[usize],
+    ) -> Vec<Option<[u8; 16]>> {
+        let trusted: HashSet<usize> = trusted_indices.iter().copied().collect();
+        fixture
+            .chunks
+            .iter()
+            .enumerate()
+            .map(|(index, chunk)| {
+                trusted.contains(&index).then(|| {
+                    let start = chunk.offset as usize;
+                    let end = (chunk.offset + chunk.length) as usize;
+                    compute_mega_chunk_mac(
+                        &fixture.plaintext[start..end],
+                        &fixture.node.aes_key,
+                        fixture.node.aes_iv.as_ref().unwrap(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    fn writer_with_trusted_plaintext(
+        fixture: &ResumableFixture,
+        trusted_chunks: &[Option<[u8; 16]>],
+    ) -> SharedWriter {
+        let mut data = vec![0; fixture.plaintext.len()];
+        for (index, mac) in trusted_chunks.iter().enumerate() {
+            if mac.is_some() {
+                let chunk = fixture.chunks[index];
+                let start = chunk.offset as usize;
+                let end = (chunk.offset + chunk.length) as usize;
+                data[start..end].copy_from_slice(&fixture.plaintext[start..end]);
+            }
+        }
+        SharedWriter::with_data(data)
+    }
+
+    #[tokio::test]
+    async fn resumable_skips_trusted_chunks() {
+        let fixture = resumable_fixture(800_000);
+        let trusted = trusted_chunk_macs(&fixture, &[0, 2]);
+        let writer = writer_with_trusted_plaintext(&fixture, &trusted);
+        let http = MockHttpClient::new(fixture.encrypted.clone());
+
+        download_parallel_resumable(
+            &http,
+            &fixture.node,
+            "http://example.test/file".to_string(),
+            fixture.plaintext.len() as u64,
+            writer.clone(),
+            4,
+            None,
+            Some(trusted.into()),
+            None,
+            *fixture.node.aes_iv.as_ref().unwrap(),
+            *fixture.node.condensed_mac.as_ref().unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let requested_starts: HashSet<u64> = http
+            .requests()
+            .into_iter()
+            .map(|(start, _)| start)
+            .collect();
+        assert!(!requested_starts.contains(&fixture.chunks[0].offset));
+        assert!(!requested_starts.contains(&fixture.chunks[2].offset));
+        assert_eq!(writer.bytes(), fixture.plaintext);
+    }
+
+    #[tokio::test]
+    async fn resumable_mixed_chunks_writes_complete_plaintext() {
+        let fixture = resumable_fixture(800_000);
+        let trusted = trusted_chunk_macs(&fixture, &[1]);
+        let writer = writer_with_trusted_plaintext(&fixture, &trusted);
+        let http = MockHttpClient::new(fixture.encrypted.clone());
+
+        download_parallel_resumable(
+            &http,
+            &fixture.node,
+            "http://example.test/file".to_string(),
+            fixture.plaintext.len() as u64,
+            writer.clone(),
+            3,
+            None,
+            Some(trusted.into()),
+            None,
+            *fixture.node.aes_iv.as_ref().unwrap(),
+            *fixture.node.condensed_mac.as_ref().unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(writer.bytes(), fixture.plaintext);
+    }
+
+    #[tokio::test]
+    async fn resumable_all_chunks_trusted_makes_no_http_requests() {
+        let fixture = resumable_fixture(800_000);
+        let all_indices: Vec<_> = (0..fixture.chunks.len()).collect();
+        let trusted = trusted_chunk_macs(&fixture, &all_indices);
+        let writer = writer_with_trusted_plaintext(&fixture, &trusted);
+        let http = MockHttpClient::new(fixture.encrypted.clone());
+
+        download_parallel_resumable(
+            &http,
+            &fixture.node,
+            "http://example.test/file".to_string(),
+            fixture.plaintext.len() as u64,
+            writer,
+            4,
+            None,
+            Some(trusted.into()),
+            None,
+            *fixture.node.aes_iv.as_ref().unwrap(),
+            *fixture.node.condensed_mac.as_ref().unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert!(http.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn resumable_rejects_bad_trusted_mac() {
+        let fixture = resumable_fixture(800_000);
+        let all_indices: Vec<_> = (0..fixture.chunks.len()).collect();
+        let mut trusted = trusted_chunk_macs(&fixture, &all_indices);
+        trusted[0] = Some([0xFF; 16]);
+        let writer = writer_with_trusted_plaintext(&fixture, &trusted);
+        let http = MockHttpClient::new(fixture.encrypted.clone());
+
+        let err = download_parallel_resumable(
+            &http,
+            &fixture.node,
+            "http://example.test/file".to_string(),
+            fixture.plaintext.len() as u64,
+            writer,
+            4,
+            None,
+            Some(trusted.into()),
+            None,
+            *fixture.node.aes_iv.as_ref().unwrap(),
+            *fixture.node.condensed_mac.as_ref().unwrap(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, Error::CondensedMacMismatch));
+        assert!(http.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn resumable_progress_includes_trusted_prefix_then_fetched_bytes() {
+        let fixture = resumable_fixture(800_000);
+        let trusted = trusted_chunk_macs(&fixture, &[0, 1]);
+        let trusted_bytes: u64 = fixture.chunks[0].length + fixture.chunks[1].length;
+        let writer = writer_with_trusted_plaintext(&fixture, &trusted);
+        let http = MockHttpClient::new(fixture.encrypted.clone());
+        let progress = Arc::new(Mutex::new(Vec::new()));
+        let progress_for_cb = Arc::clone(&progress);
+
+        download_parallel_resumable(
+            &http,
+            &fixture.node,
+            "http://example.test/file".to_string(),
+            fixture.plaintext.len() as u64,
+            writer,
+            1,
+            Some(Arc::new(move |bytes| {
+                progress_for_cb.lock().unwrap().push(bytes);
+            })),
+            Some(trusted.into()),
+            None,
+            *fixture.node.aes_iv.as_ref().unwrap(),
+            *fixture.node.condensed_mac.as_ref().unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let progress = progress.lock().unwrap().clone();
+        assert_eq!(progress.first().copied(), Some(trusted_bytes));
+        assert_eq!(
+            progress.last().copied(),
+            Some(fixture.plaintext.len() as u64)
+        );
+        assert!(progress.windows(2).all(|window| window[1] > window[0]));
+    }
+
+    #[tokio::test]
+    async fn chunk_verified_runs_after_sync() {
+        let key = [0x42u8; 16];
+        let iv = [0x13u8; 16];
+        let iv8 = [0x13u8; 8];
+        let plaintext = b"persist me".to_vec();
+        let mut encrypted = plaintext.clone();
+        decrypt(&key, &iv, 0, &mut encrypted);
+
+        let writer = SharedWriter::default();
+        let callback_events = Arc::new(Mutex::new(Vec::new()));
+        let callback_events_for_cb = Arc::clone(&callback_events);
+        let mac = Arc::new(ParallelMacProcessor::new(
+            plaintext.len() as u64,
+            &key,
+            &iv8,
+        ));
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(DownloadedChunk {
+            index: 0,
+            offset: 0,
+            data: encrypted,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        process_chunks(
+            rx,
+            writer.clone(),
+            mac,
+            key,
+            iv,
+            iv8,
+            Some(Arc::new(move |_index, _mac| {
+                callback_events_for_cb.lock().unwrap().push("callback");
+            })),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(writer.bytes(), plaintext);
+        assert_eq!(writer.sync_calls(), 1);
+        let writer_journal = writer.journal();
+        let sync_pos = writer_journal.iter().position(|entry| *entry == "sync");
+        assert_eq!(sync_pos, Some(1));
+        assert_eq!(callback_events.lock().unwrap().as_slice(), &["callback"]);
+    }
+
+    #[tokio::test]
+    async fn chunk_verified_is_not_reported_if_sync_fails() {
+        let key = [0x33u8; 16];
+        let iv = [0x19u8; 16];
+        let iv8 = [0x19u8; 8];
+        let plaintext = b"bad flush".to_vec();
+        let mut encrypted = plaintext.clone();
+        decrypt(&key, &iv, 0, &mut encrypted);
+
+        let writer = SharedWriter::default();
+        writer.set_fail_sync(true);
+        let callback_count = Arc::new(Mutex::new(0usize));
+        let callback_count_for_cb = Arc::clone(&callback_count);
+        let mac = Arc::new(ParallelMacProcessor::new(
+            plaintext.len() as u64,
+            &key,
+            &iv8,
+        ));
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(DownloadedChunk {
+            index: 0,
+            offset: 0,
+            data: encrypted,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        let err = process_chunks(
+            rx,
+            writer.clone(),
+            mac,
+            key,
+            iv,
+            iv8,
+            Some(Arc::new(move |_index, _mac| {
+                *callback_count_for_cb.lock().unwrap() += 1;
+            })),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("simulated sync failure"));
+        assert_eq!(*callback_count.lock().unwrap(), 0);
     }
 }
