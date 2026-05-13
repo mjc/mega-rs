@@ -1287,7 +1287,7 @@ impl Client {
         num_connections: usize,
     ) -> Result<()>
     where
-        W: futures::io::AsyncWrite + futures::io::AsyncSeek + Unpin + Send + 'static,
+        W: tokio::io::AsyncWrite + tokio::io::AsyncSeek + Unpin + Send + 'static,
     {
         self.download_node_parallel_with_progress::<W, fn(u64)>(node, writer, num_connections, None)
             .await
@@ -1300,7 +1300,7 @@ impl Client {
     ///
     /// # Arguments
     /// * `node` - The node to download
-    /// * `writer` - An async writer that supports seeking (e.g., any `futures::io::AsyncWrite + AsyncSeek`)
+    /// * `writer` - An async writer that supports seeking (e.g., any `tokio::io::AsyncWrite + AsyncSeek`)
     /// * `num_connections` - Number of parallel download workers (recommended: 4-8 for optimal throughput)
     /// * `progress` - Optional callback invoked with the cumulative number of bytes downloaded so far
     ///   (reports are monotonically increasing and may skip values due to concurrent worker ordering)
@@ -1313,7 +1313,7 @@ impl Client {
         progress: Option<F>,
     ) -> Result<()>
     where
-        W: futures::io::AsyncWrite + futures::io::AsyncSeek + Unpin + Send + 'static,
+        W: tokio::io::AsyncWrite + tokio::io::AsyncSeek + Unpin + Send + 'static,
         F: Fn(u64) + Send + Sync + 'static,
     {
         if !node.kind.is_file() {

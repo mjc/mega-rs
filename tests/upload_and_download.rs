@@ -90,7 +90,6 @@ async fn upload_and_download_test() {
 async fn upload_and_parallel_download_test() {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
-    use tokio_util::compat::TokioAsyncReadCompatExt;
 
     let Ok(email) = env::var("MEGA_EMAIL") else {
         eprintln!(
@@ -157,7 +156,7 @@ async fn upload_and_parallel_download_test() {
         .get_node_by_path(&file_path)
         .expect("could not find test file node after upload");
 
-    // Use a temp file as a seekable async writer via tokio_util::compat
+    // Use a temp file as a seekable async writer.
     let temp_dir = env::temp_dir();
     let temp_path = temp_dir.join(&file_name);
     let file = tokio::fs::OpenOptions::new()
@@ -175,7 +174,7 @@ async fn upload_and_parallel_download_test() {
 
     mega.download_node_parallel_with_progress(
         node,
-        file.compat(),
+        file,
         4,
         Some(move |bytes: u64| {
             progress_clone.fetch_max(bytes, Ordering::Relaxed);

@@ -9,13 +9,15 @@ use std::io::SeekFrom;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use aes::Aes128;
 use async_trait::async_trait;
 use cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
 use futures::io::Cursor;
-use futures::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::mpsc;
+use tokio::io::{AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
+use futures::AsyncReadExt;
 
 use crate::error::{Error, Result};
 use crate::fingerprint::{
@@ -29,17 +31,15 @@ use crate::Node;
 const MAX_PARALLEL_WORKERS: usize = 16;
 
 #[async_trait]
-pub trait ParallelDownloadWriter:
-    futures::io::AsyncWrite + futures::io::AsyncSeek + Unpin + Send
-{
+pub trait ParallelDownloadWriter: AsyncWrite + AsyncSeek + Unpin + Send {
     async fn sync_data(&mut self) -> std::io::Result<()>;
 }
 
 #[cfg(feature = "reqwest")]
 #[async_trait]
-impl ParallelDownloadWriter for tokio_util::compat::Compat<tokio::fs::File> {
+impl ParallelDownloadWriter for tokio::fs::File {
     async fn sync_data(&mut self) -> std::io::Result<()> {
-        self.get_mut().sync_data().await
+        tokio::fs::File::sync_data(self).await
     }
 }
 
@@ -51,50 +51,50 @@ impl<W> NoSyncWriter<W> {
     }
 }
 
-impl<W> futures::io::AsyncWrite for NoSyncWriter<W>
+impl<W> AsyncWrite for NoSyncWriter<W>
 where
-    W: futures::io::AsyncWrite + Unpin,
+    W: AsyncWrite + Unpin,
 {
     fn poll_write(
         self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
+        cx: &mut Context<'_>,
         buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
+    ) -> Poll<std::io::Result<usize>> {
         Pin::new(&mut self.get_mut().0).poll_write(cx, buf)
     }
 
     fn poll_flush(
         self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.get_mut().0).poll_flush(cx)
     }
 
-    fn poll_close(
+    fn poll_shutdown(
         self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().0).poll_close(cx)
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
     }
 }
 
-impl<W> futures::io::AsyncSeek for NoSyncWriter<W>
+impl<W> AsyncSeek for NoSyncWriter<W>
 where
-    W: futures::io::AsyncSeek + Unpin,
+    W: AsyncSeek + Unpin,
 {
-    fn poll_seek(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        pos: SeekFrom,
-    ) -> std::task::Poll<std::io::Result<u64>> {
-        Pin::new(&mut self.get_mut().0).poll_seek(cx, pos)
+    fn start_seek(self: Pin<&mut Self>, pos: SeekFrom) -> std::io::Result<()> {
+        Pin::new(&mut self.get_mut().0).start_seek(pos)
+    }
+
+    fn poll_complete(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<u64>> {
+        Pin::new(&mut self.get_mut().0).poll_complete(cx)
     }
 }
 
 #[async_trait]
 impl<W> ParallelDownloadWriter for NoSyncWriter<W>
 where
-    W: futures::io::AsyncWrite + futures::io::AsyncSeek + Unpin + Send,
+    W: AsyncWrite + AsyncSeek + Unpin + Send,
 {
     async fn sync_data(&mut self) -> std::io::Result<()> {
         Ok(())
@@ -333,7 +333,7 @@ pub(crate) async fn download_parallel<W>(
     expected_mac: [u8; 8],
 ) -> Result<()>
 where
-    W: futures::io::AsyncWrite + futures::io::AsyncSeek + Unpin + Send + 'static,
+    W: AsyncWrite + AsyncSeek + Unpin + Send + 'static,
 {
     download_parallel_resumable(
         client,
@@ -546,7 +546,7 @@ mod tests {
     use std::task::{Context, Poll};
 
     use async_trait::async_trait;
-    use futures::io::{AsyncRead, AsyncSeek, AsyncWrite};
+    use futures::io::AsyncRead;
     use url::Url;
 
     use crate::http::{ClientState, HttpClient};
@@ -678,17 +678,16 @@ mod tests {
             Poll::Ready(Ok(()))
         }
 
-        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
         }
     }
 
     impl AsyncSeek for SharedWriter {
-        fn poll_seek(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            pos: SeekFrom,
-        ) -> Poll<std::io::Result<u64>> {
+        fn start_seek(self: Pin<&mut Self>, pos: SeekFrom) -> std::io::Result<()> {
             let mut inner = self.inner.lock().unwrap();
             let len = inner.data.len() as i128;
             let current = i128::from(inner.pos);
@@ -698,12 +697,20 @@ mod tests {
                 SeekFrom::Current(offset) => current + i128::from(offset),
             };
             if next < 0 || next > i128::from(u64::MAX) {
-                return Poll::Ready(Err(std::io::Error::new(
+                return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "invalid seek",
-                )));
+                ));
             }
             inner.pos = next as u64;
+            Ok(())
+        }
+
+        fn poll_complete(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<u64>> {
+            let inner = self.inner.lock().unwrap();
             Poll::Ready(Ok(inner.pos))
         }
     }
