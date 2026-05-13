@@ -143,8 +143,7 @@ impl ChunkBufferPool {
         }
     }
 
-    fn release(&self, mut buffer: Vec<u8>) {
-        buffer.clear();
+    fn release(&self, buffer: Vec<u8>) {
         match self.buffers.lock() {
             Ok(mut guard) => guard.push(buffer),
             Err(poisoned) => poisoned.into_inner().push(buffer),
@@ -253,7 +252,11 @@ async fn download_worker(client: &dyn HttpClient, ctx: DownloadContext) -> Resul
         if buffer.capacity() < target_size {
             buffer.reserve(target_size - buffer.capacity());
         }
-        buffer.resize(target_size, 0);
+        if buffer.len() < target_size {
+            buffer.resize(target_size, 0);
+        } else {
+            buffer.truncate(target_size);
+        }
 
         let url = range.url(&ctx.base_url).parse()?;
         let mut response = client.get(url).await?;
