@@ -211,6 +211,13 @@ fn write_all_at_blocking(file: &StdFile, mut offset: u64, mut data: &[u8]) -> io
     Ok(())
 }
 
+fn reserve_plaintext_buffer(buffer: &mut Vec<u8>, target_size: usize) {
+    buffer.clear();
+    if buffer.capacity() < target_size {
+        buffer.reserve_exact(target_size - buffer.capacity());
+    }
+}
+
 // ============================================================================
 // Download worker
 // ============================================================================
@@ -387,6 +394,14 @@ async fn stream_download_worker_to_file(
     client: &dyn HttpClient,
     ctx: StreamingFileDownloadContext,
 ) -> Result<()> {
+    let max_chunk_len = ctx
+        .chunks
+        .iter()
+        .map(|chunk| chunk.length as usize)
+        .max()
+        .unwrap_or(0);
+    let mut plaintext = Vec::with_capacity(max_chunk_len);
+
     loop {
         let idx = ctx.next_chunk.fetch_add(1, Ordering::Relaxed);
         let Some(range) = ctx.chunks.get(idx as usize).copied() else {
@@ -405,7 +420,7 @@ async fn stream_download_worker_to_file(
         let mut remaining = range.length as usize;
         let mut file_offset = range.offset;
         let mut chunk_mac = MegaChunkMac::new(&ctx.aes_key, &ctx.aes_iv_8);
-        let mut plaintext = Vec::with_capacity(range.length as usize);
+        reserve_plaintext_buffer(&mut plaintext, remaining);
 
         while let Some(bytes) = response.try_next().await? {
             let read_len = bytes.len();
@@ -903,6 +918,23 @@ mod tests {
 
         assert_eq!(&whole[..32], &part1[..]);
         assert_eq!(&whole[32..], &part2[..]);
+    }
+
+    #[test]
+    fn plaintext_buffer_reuses_existing_allocation_without_zero_fill() {
+        let mut buffer = Vec::new();
+        reserve_plaintext_buffer(&mut buffer, 1024);
+        let capacity = buffer.capacity();
+        let ptr = buffer.as_ptr();
+
+        buffer.extend_from_slice(&vec![7; 1024]);
+        reserve_plaintext_buffer(&mut buffer, 512);
+
+        assert_eq!(buffer.len(), 0);
+        assert_eq!(buffer.capacity(), capacity);
+        assert_eq!(buffer.as_ptr(), ptr);
+        buffer.extend_from_slice(&[1, 2, 3]);
+        assert_eq!(buffer, [1, 2, 3]);
     }
 
     #[derive(Clone, Default)]
