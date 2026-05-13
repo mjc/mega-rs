@@ -112,6 +112,28 @@ struct DownloadedChunk {
     data: Vec<u8>,
 }
 
+#[derive(Default)]
+struct ChunkBufferPool {
+    buffers: std::sync::Mutex<Vec<Vec<u8>>>,
+}
+
+impl ChunkBufferPool {
+    fn acquire(&self) -> Vec<u8> {
+        match self.buffers.lock() {
+            Ok(mut guard) => guard.pop().unwrap_or_default(),
+            Err(poisoned) => poisoned.into_inner().pop().unwrap_or_default(),
+        }
+    }
+
+    fn release(&self, mut buffer: Vec<u8>) {
+        buffer.clear();
+        match self.buffers.lock() {
+            Ok(mut guard) => guard.push(buffer),
+            Err(poisoned) => poisoned.into_inner().push(buffer),
+        }
+    }
+}
+
 // ============================================================================
 // Chunk calculation
 // ============================================================================
@@ -149,6 +171,7 @@ struct DownloadContext {
     next_chunk: Arc<AtomicU64>,
     chunks: Arc<[MegaChunk]>,
     trusted_chunks: Arc<[Option<[u8; 16]>]>,
+    buffer_pool: Arc<ChunkBufferPool>,
     tx: mpsc::Sender<DownloadedChunk>,
     progress: Option<Arc<dyn Fn(u64) + Send + Sync>>,
     progress_total: Option<Arc<AtomicU64>>,
@@ -170,7 +193,14 @@ async fn download_worker(client: &dyn HttpClient, ctx: DownloadContext) -> Resul
         }
 
         let target_size = range.length as usize;
-        let mut buffer = vec![0u8; target_size];
+        let mut buffer = ctx.buffer_pool.acquire();
+        if buffer.capacity() < target_size {
+            buffer.reserve(target_size - buffer.capacity());
+        }
+        // The HTTP read loop below fills exactly `target_size` bytes before any read access.
+        unsafe {
+            buffer.set_len(target_size);
+        }
 
         let url = range.url(&ctx.base_url).parse()?;
         let mut response = client.get(url).await?;
@@ -232,6 +262,7 @@ async fn process_chunks<W>(
     aes_key: [u8; 16],
     aes_iv: [u8; 16],
     aes_iv_8: [u8; 8],
+    buffer_pool: Arc<ChunkBufferPool>,
     chunk_verified: Option<Arc<dyn Fn(u32, [u8; 16]) + Send + Sync>>,
 ) -> Result<()>
 where
@@ -259,11 +290,12 @@ where
 
         let chunk_index = chunk.index;
         let chunk_mac = decrypted.0;
+        let mut data = decrypted.1;
         mac.set_chunk_mac(chunk_index as usize, chunk_mac);
 
         // Write to file
         writer.seek(SeekFrom::Start(offset)).await?;
-        writer.write_all(&decrypted.1).await?;
+        writer.write_all(&data).await?;
         if durability_available {
             writer.flush().await?;
             match writer.sync_data().await {
@@ -277,6 +309,7 @@ where
                 }
             }
         }
+        buffer_pool.release(std::mem::take(&mut data));
     }
 
     writer.flush().await?;
@@ -434,9 +467,11 @@ where
     let progress_reported = progress
         .as_ref()
         .map(|_| Arc::new(AtomicU64::new(trusted_bytes)));
+    let buffer_pool = Arc::new(ChunkBufferPool::default());
 
     // Processor task: decrypt, write, MAC
     let processor_mac = Arc::clone(&mac);
+    let processor_pool = Arc::clone(&buffer_pool);
     let processor_handle = tokio::spawn(async move {
         process_chunks(
             rx,
@@ -445,6 +480,7 @@ where
             aes_key,
             aes_iv_16,
             aes_iv_8,
+            processor_pool,
             chunk_verified,
         )
         .await
@@ -458,6 +494,7 @@ where
                 next_chunk: Arc::clone(&next_chunk),
                 chunks: Arc::clone(&chunks),
                 trusted_chunks: Arc::clone(&trusted_chunks),
+                buffer_pool: Arc::clone(&buffer_pool),
                 tx: tx.clone(),
                 progress: progress.clone(),
                 progress_total: progress_total.clone(),
@@ -1032,6 +1069,7 @@ mod tests {
             key,
             iv,
             iv8,
+            Arc::new(ChunkBufferPool::default()),
             Some(Arc::new(move |_index, _mac| {
                 callback_events_for_cb.lock().unwrap().push("callback");
             })),
@@ -1082,6 +1120,7 @@ mod tests {
             key,
             iv,
             iv8,
+            Arc::new(ChunkBufferPool::default()),
             Some(Arc::new(move |_index, _mac| {
                 *callback_count_for_cb.lock().unwrap() += 1;
             })),

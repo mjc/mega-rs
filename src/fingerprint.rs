@@ -4,7 +4,7 @@ use std::pin::pin;
 
 use aes::Aes128;
 use base64::prelude::{Engine, BASE64_URL_SAFE_NO_PAD};
-use cipher::{BlockEncryptMut, KeyIvInit};
+use cipher::{BlockEncrypt, KeyInit};
 use futures::io::{AsyncRead, AsyncReadExt};
 
 #[cfg(feature = "parallel")]
@@ -230,10 +230,8 @@ pub async fn compute_condensed_mac<R: AsyncRead>(
     aes_iv: &[u8; 8],
 ) -> Result<[u8; 8]> {
     let mut chunk_size: u64 = 131_072; // 2^17
-    let mut cur_mac = [0u8; 16];
-
+    let aes = Aes128::new(aes_key.into());
     let mut final_mac_data = [0u8; 16];
-    let mut final_mac = cbc::Encryptor::<Aes128>::new(aes_key.into(), (&final_mac_data).into());
 
     let mut buffer = {
         let chunk_size = usize::try_from(chunk_size).unwrap();
@@ -263,18 +261,8 @@ pub async fn compute_condensed_mac<R: AsyncRead>(
 
         let (chunks, leftover) = buffer.split_at(buffer.len() - buffer.len() % 16);
 
-        let mut mac = cbc::Encryptor::<Aes128>::new(aes_key.into(), (&aes_iv).into());
-        for chunk in chunks.chunks_exact(16) {
-            mac.encrypt_block_b2b_mut(chunk.into(), (&mut cur_mac).into());
-        }
-
-        if !leftover.is_empty() {
-            let mut padded_chunk = [0u8; 16];
-            padded_chunk[..leftover.len()].copy_from_slice(leftover);
-            mac.encrypt_block_b2b_mut((&padded_chunk).into(), (&mut cur_mac).into());
-        }
-
-        final_mac.encrypt_block_b2b_mut((&cur_mac).into(), (&mut final_mac_data).into());
+        let cur_mac = compute_chunk_mac_with_cipher(&aes, &aes_iv, chunks, leftover);
+        encrypt_cbc_block(&aes, &mut final_mac_data, &cur_mac);
 
         if chunk_size < 1_048_576 {
             chunk_size += 131_072;
@@ -505,21 +493,9 @@ impl ParallelMacProcessor {
 /// Standalone MAC computation for use with spawn_blocking
 #[cfg(feature = "parallel")]
 fn compute_chunk_mac_inner(aes_key: &[u8; 16], aes_iv: &[u8; 16], data: &[u8]) -> [u8; 16] {
-    let mut cur_mac = [0u8; 16];
     let (blocks, leftover) = data.split_at(data.len() - data.len() % 16);
-
-    let mut mac = cbc::Encryptor::<Aes128>::new(aes_key.into(), aes_iv.into());
-    for block in blocks.chunks_exact(16) {
-        mac.encrypt_block_b2b_mut(block.into(), (&mut cur_mac).into());
-    }
-
-    if !leftover.is_empty() {
-        let mut padded = [0u8; 16];
-        padded[..leftover.len()].copy_from_slice(leftover);
-        mac.encrypt_block_b2b_mut((&padded).into(), (&mut cur_mac).into());
-    }
-
-    cur_mac
+    let aes = Aes128::new(aes_key.into());
+    compute_chunk_mac_with_cipher(&aes, aes_iv, blocks, leftover)
 }
 
 /// Computes a single MEGA plaintext chunk MAC.
@@ -533,6 +509,33 @@ pub fn compute_mega_chunk_mac(data: &[u8], aes_key: &[u8; 16], aes_iv: &[u8; 8])
         iv
     };
     compute_chunk_mac_inner(aes_key, &aes_iv_full, data)
+}
+
+fn compute_chunk_mac_with_cipher(
+    aes: &Aes128,
+    aes_iv: &[u8; 16],
+    blocks: &[u8],
+    leftover: &[u8],
+) -> [u8; 16] {
+    let mut cur_mac = *aes_iv;
+    for block in blocks.chunks_exact(16) {
+        encrypt_cbc_block(aes, &mut cur_mac, block.try_into().expect("16-byte block"));
+    }
+
+    if !leftover.is_empty() {
+        let mut padded = [0u8; 16];
+        padded[..leftover.len()].copy_from_slice(leftover);
+        encrypt_cbc_block(aes, &mut cur_mac, &padded);
+    }
+
+    cur_mac
+}
+
+fn encrypt_cbc_block(aes: &Aes128, state: &mut [u8; 16], input: &[u8; 16]) {
+    for (dst, src) in state.iter_mut().zip(input) {
+        *dst ^= *src;
+    }
+    aes.encrypt_block(state.into());
 }
 
 #[cfg(feature = "parallel")]
@@ -684,6 +687,7 @@ impl ParallelMacProcessor {
     /// Finalize and return the combined MAC
     pub fn finalize(&self) -> Option<[u8; 8]> {
         let num_chunks = self.chunk_boundaries.len();
+        let aes = Aes128::new((&self.aes_key).into());
 
         // Verify we have all chunks
         for idx in 0..num_chunks {
@@ -694,12 +698,10 @@ impl ParallelMacProcessor {
 
         // Combine MACs in order
         let mut final_mac_data = [0u8; 16];
-        let mut final_mac =
-            cbc::Encryptor::<Aes128>::new((&self.aes_key).into(), (&final_mac_data).into());
 
         for idx in 0..num_chunks {
             let cur_mac = self.chunk_macs[idx].load()?;
-            final_mac.encrypt_block_b2b_mut((&cur_mac).into(), (&mut final_mac_data).into());
+            encrypt_cbc_block(&aes, &mut final_mac_data, &cur_mac);
         }
 
         // XOR to produce final 8-byte MAC
@@ -723,10 +725,8 @@ pub fn compute_condensed_mac_from_buffer(
     aes_iv: &[u8; 8],
 ) -> Result<[u8; 8]> {
     let mut chunk_size: usize = 131_072; // 2^17
-    let mut cur_mac = [0u8; 16];
-
+    let aes = Aes128::new(aes_key.into());
     let mut final_mac_data = [0u8; 16];
-    let mut final_mac = cbc::Encryptor::<Aes128>::new(aes_key.into(), (&final_mac_data).into());
 
     let aes_iv_full = {
         let mut iv = [0u8; 16];
@@ -762,19 +762,8 @@ pub fn compute_condensed_mac_from_buffer(
         let chunk_data = &data[offset..end];
 
         let (chunks, leftover) = chunk_data.split_at(chunk_data.len() - chunk_data.len() % 16);
-
-        let mut mac = cbc::Encryptor::<Aes128>::new(aes_key.into(), (&aes_iv_full).into());
-        for chunk in chunks.chunks_exact(16) {
-            mac.encrypt_block_b2b_mut(chunk.into(), (&mut cur_mac).into());
-        }
-
-        if !leftover.is_empty() {
-            let mut padded_chunk = [0u8; 16];
-            padded_chunk[..leftover.len()].copy_from_slice(leftover);
-            mac.encrypt_block_b2b_mut((&padded_chunk).into(), (&mut cur_mac).into());
-        }
-
-        final_mac.encrypt_block_b2b_mut((&cur_mac).into(), (&mut final_mac_data).into());
+        let cur_mac = compute_chunk_mac_with_cipher(&aes, &aes_iv_full, chunks, leftover);
+        encrypt_cbc_block(&aes, &mut final_mac_data, &cur_mac);
 
         if chunk_size < 1_048_576 {
             chunk_size += 131_072;
