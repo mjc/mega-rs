@@ -15,7 +15,6 @@ use std::task::{Context, Poll};
 
 use aes::Aes128;
 use async_trait::async_trait;
-use bytes::BytesMut;
 use cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
 use futures::io::Cursor;
 use futures::TryStreamExt;
@@ -406,6 +405,7 @@ async fn stream_download_worker_to_file(
         let mut remaining = range.length as usize;
         let mut file_offset = range.offset;
         let mut chunk_mac = MegaChunkMac::new(&ctx.aes_key, &ctx.aes_iv_8);
+        let mut plaintext = Vec::with_capacity(range.length as usize);
 
         while let Some(bytes) = response.try_next().await? {
             let read_len = bytes.len();
@@ -420,20 +420,11 @@ async fn stream_download_worker_to_file(
                 .into());
             }
 
-            let mut chunk = match bytes.try_into_mut() {
-                Ok(bytes) => bytes,
-                Err(bytes) => {
-                    let mut buf = BytesMut::with_capacity(bytes.len());
-                    buf.extend_from_slice(&bytes);
-                    buf
-                }
-            };
-            decrypt(&ctx.aes_key, &ctx.aes_iv, file_offset, &mut chunk);
-            chunk_mac.update(&chunk);
-
-            tokio::task::block_in_place(|| {
-                write_all_at_blocking(&ctx.std_file, file_offset, &chunk)
-            })?;
+            let start = plaintext.len();
+            plaintext.extend_from_slice(&bytes);
+            let chunk = &mut plaintext[start..];
+            decrypt(&ctx.aes_key, &ctx.aes_iv, file_offset, chunk);
+            chunk_mac.update(chunk);
 
             file_offset += read_len as u64;
             remaining -= read_len;
@@ -457,6 +448,10 @@ async fn stream_download_worker_to_file(
         let chunk_index = range.index;
         let chunk_mac = chunk_mac.finalize();
         ctx.mac.set_chunk_mac(chunk_index as usize, chunk_mac);
+
+        tokio::task::block_in_place(|| {
+            write_all_at_blocking(&ctx.std_file, range.offset, &plaintext)
+        })?;
 
         if let Some(ref cb) = ctx.chunk_verified {
             cb(chunk_index, chunk_mac);
@@ -1026,6 +1021,7 @@ mod tests {
     struct MockHttpClient {
         encrypted: Vec<u8>,
         requests: Arc<Mutex<Vec<(u64, u64)>>>,
+        fragment_size: Option<usize>,
     }
 
     impl MockHttpClient {
@@ -1033,7 +1029,13 @@ mod tests {
             Self {
                 encrypted,
                 requests: Arc::new(Mutex::new(Vec::new())),
+                fragment_size: None,
             }
+        }
+
+        fn with_fragment_size(mut self, fragment_size: usize) -> Self {
+            self.fragment_size = Some(fragment_size.max(1));
+            self
         }
 
         fn requests(&self) -> Vec<(u64, u64)> {
@@ -1076,6 +1078,13 @@ mod tests {
             let start_usize = usize::try_from(start).map_err(std::io::Error::other)?;
             let end_usize = usize::try_from(end).map_err(std::io::Error::other)?;
             let bytes = self.encrypted[start_usize..=end_usize].to_vec();
+            if let Some(fragment_size) = self.fragment_size {
+                let fragments = bytes
+                    .chunks(fragment_size)
+                    .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+                    .collect::<Vec<_>>();
+                return Ok(Box::pin(stream::iter(fragments)));
+            }
             Ok(Box::pin(stream::iter([Ok(Bytes::from(bytes))])))
         }
 
@@ -1425,6 +1434,49 @@ mod tests {
             3,
             None,
             Some(trusted.into()),
+            None,
+            *fixture.node.aes_iv.as_ref().unwrap(),
+            *fixture.node.condensed_mac.as_ref().unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let bytes = tokio::fs::read(&path).await.unwrap();
+        let _ = tokio::fs::remove_file(&path).await;
+        assert_eq!(bytes, fixture.plaintext);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resumable_streaming_file_path_handles_fragmented_http_frames() {
+        let fixture = resumable_fixture(800_000);
+        let http = MockHttpClient::new(fixture.encrypted.clone()).with_fragment_size(8191);
+        let path = std::env::temp_dir().join(format!(
+            "mega-parallel-fragmented-{}-{}.part",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .read(true)
+            .open(&path)
+            .await
+            .unwrap();
+        file.set_len(fixture.plaintext.len() as u64).await.unwrap();
+
+        download_parallel_resumable_to_file(
+            &http,
+            &fixture.node,
+            "http://example.test/file".to_string(),
+            fixture.plaintext.len() as u64,
+            file,
+            3,
+            None,
+            None,
             None,
             *fixture.node.aes_iv.as_ref().unwrap(),
             *fixture.node.condensed_mac.as_ref().unwrap(),
