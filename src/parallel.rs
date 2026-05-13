@@ -197,10 +197,7 @@ async fn download_worker(client: &dyn HttpClient, ctx: DownloadContext) -> Resul
         if buffer.capacity() < target_size {
             buffer.reserve(target_size - buffer.capacity());
         }
-        // The HTTP read loop below fills exactly `target_size` bytes before any read access.
-        unsafe {
-            buffer.set_len(target_size);
-        }
+        buffer.resize(target_size, 0);
 
         let url = range.url(&ctx.base_url).parse()?;
         let mut response = client.get(url).await?;
