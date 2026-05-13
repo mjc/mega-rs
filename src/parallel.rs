@@ -12,6 +12,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use aes::Aes128;
 use async_trait::async_trait;
@@ -155,6 +156,10 @@ impl MegaChunk {
         self.offset + self.length
     }
 
+    fn is_tail_of(&self, file_size: u64) -> bool {
+        self.end() >= file_size
+    }
+
     fn url(&self, base_url: &str) -> String {
         format!(
             "{base_url}/{}-{}",
@@ -223,9 +228,6 @@ struct DownloadContext {
     trusted_chunks: Arc<[Option<[u8; 16]>]>,
     buffer_pool: Arc<ChunkBufferPool>,
     tx: mpsc::Sender<DownloadedChunk>,
-    progress: Option<Arc<dyn Fn(u64) + Send + Sync>>,
-    progress_total: Option<Arc<AtomicU64>>,
-    progress_reported: Option<Arc<AtomicU64>>,
 }
 
 async fn download_worker(client: &dyn HttpClient, ctx: DownloadContext) -> Result<()> {
@@ -272,18 +274,6 @@ async fn download_worker(client: &dyn HttpClient, ctx: DownloadContext) -> Resul
             }
             buffer[bytes_read..end].copy_from_slice(chunk);
             bytes_read = end;
-            if let Some(ref total) = ctx.progress_total {
-                let new_total =
-                    total.fetch_add(chunk.len() as u64, Ordering::Relaxed) + chunk.len() as u64;
-                if let Some(ref reported) = ctx.progress_reported {
-                    let prev = reported.fetch_max(new_total, Ordering::Relaxed);
-                    if new_total > prev {
-                        if let Some(ref cb) = ctx.progress {
-                            cb(new_total);
-                        }
-                    }
-                }
-            }
             if bytes_read == target_size {
                 break;
             }
@@ -326,11 +316,13 @@ async fn process_chunks<W>(
     aes_iv_8: [u8; 8],
     buffer_pool: Arc<ChunkBufferPool>,
     chunk_verified: Option<Arc<dyn Fn(u32, [u8; 16]) + Send + Sync>>,
+    progress: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+    progress_total: Option<Arc<AtomicU64>>,
+    progress_reported: Option<Arc<AtomicU64>>,
 ) -> Result<()>
 where
     W: ParallelDownloadWriter,
 {
-    let mut durability_available = chunk_verified.is_some();
     while let Some(chunk) = rx.recv().await {
         let offset = chunk.offset;
 
@@ -357,16 +349,19 @@ where
 
         // File-backed writers can bypass Tokio's buffered async file adapter here.
         data = writer.write_chunk(offset, data).await?;
-        if durability_available {
-            writer.flush().await?;
-            match writer.sync_data().await {
-                Ok(()) => {
-                    if let Some(ref cb) = chunk_verified {
-                        cb(chunk_index, chunk_mac);
+        writer.flush().await?;
+        if let Some(ref cb) = chunk_verified {
+            cb(chunk_index, chunk_mac);
+        }
+        if let Some(ref total) = progress_total {
+            let new_total =
+                total.fetch_add(data.len() as u64, Ordering::Relaxed) + data.len() as u64;
+            if let Some(ref reported) = progress_reported {
+                let prev = reported.fetch_max(new_total, Ordering::Relaxed);
+                if new_total > prev {
+                    if let Some(ref cb) = progress {
+                        cb(new_total);
                     }
-                }
-                Err(_) => {
-                    durability_available = false;
                 }
             }
         }
@@ -379,6 +374,7 @@ where
 }
 
 struct StreamingFileDownloadContext {
+    worker_id: usize,
     base_url: String,
     next_chunk: Arc<AtomicU64>,
     chunks: Arc<[MegaChunk]>,
@@ -392,7 +388,139 @@ struct StreamingFileDownloadContext {
     aes_iv: [u8; 16],
     aes_iv_8: [u8; 8],
     chunk_verified: Option<Arc<dyn Fn(u32, [u8; 16]) + Send + Sync>>,
-    durability_available: Arc<std::sync::atomic::AtomicBool>,
+    diagnostics: Arc<StreamingDiagnostics>,
+}
+
+#[derive(Debug, Clone)]
+struct WorkerDiagnostics {
+    chunk_index: Option<u32>,
+    stage: &'static str,
+    chunk_offset: u64,
+    chunk_length: u64,
+    bytes_in_chunk: u64,
+    last_progress_total: u64,
+    updated_at: Instant,
+}
+
+impl Default for WorkerDiagnostics {
+    fn default() -> Self {
+        Self {
+            chunk_index: None,
+            stage: "idle",
+            chunk_offset: 0,
+            chunk_length: 0,
+            bytes_in_chunk: 0,
+            last_progress_total: 0,
+            updated_at: Instant::now(),
+        }
+    }
+}
+
+struct StreamingDiagnostics {
+    file_size: u64,
+    total_chunks: usize,
+    completed_chunks: AtomicU64,
+    last_progress: std::sync::Mutex<Instant>,
+    workers: std::sync::Mutex<Vec<WorkerDiagnostics>>,
+}
+
+impl StreamingDiagnostics {
+    fn new(file_size: u64, total_chunks: usize, worker_count: usize) -> Arc<Self> {
+        Arc::new(Self {
+            file_size,
+            total_chunks,
+            completed_chunks: AtomicU64::new(0),
+            last_progress: std::sync::Mutex::new(Instant::now()),
+            workers: std::sync::Mutex::new(vec![WorkerDiagnostics::default(); worker_count]),
+        })
+    }
+
+    fn update_progress_timestamp(&self) {
+        *self.last_progress.lock().unwrap() = Instant::now();
+    }
+
+    fn set_worker_chunk(&self, worker_id: usize, range: MegaChunk) {
+        let mut workers = self.workers.lock().unwrap();
+        let worker = &mut workers[worker_id];
+        worker.chunk_index = Some(range.index);
+        worker.stage = "assigned";
+        worker.chunk_offset = range.offset;
+        worker.chunk_length = range.length;
+        worker.bytes_in_chunk = 0;
+        worker.updated_at = Instant::now();
+    }
+
+    fn set_worker_stage(&self, worker_id: usize, stage: &'static str, bytes_in_chunk: u64) {
+        let mut workers = self.workers.lock().unwrap();
+        let worker = &mut workers[worker_id];
+        worker.stage = stage;
+        worker.bytes_in_chunk = bytes_in_chunk.min(worker.chunk_length);
+        worker.updated_at = Instant::now();
+    }
+
+    fn set_worker_progress_total(&self, worker_id: usize, total: u64) {
+        let mut workers = self.workers.lock().unwrap();
+        let worker = &mut workers[worker_id];
+        worker.last_progress_total = total;
+        worker.updated_at = Instant::now();
+    }
+
+    fn finish_chunk(&self, worker_id: usize, total: Option<u64>) {
+        self.completed_chunks.fetch_add(1, Ordering::Relaxed);
+        self.update_progress_timestamp();
+        let mut workers = self.workers.lock().unwrap();
+        if let Some(total) = total {
+            workers[worker_id].last_progress_total = total;
+        }
+        workers[worker_id] = WorkerDiagnostics::default();
+    }
+
+    fn stall_snapshot(&self, threshold: Duration) -> Option<String> {
+        let last_progress = *self.last_progress.lock().unwrap();
+        let stalled_for = Instant::now().saturating_duration_since(last_progress);
+        let completed = self.completed_chunks.load(Ordering::Relaxed) as usize;
+        if stalled_for < threshold || completed >= self.total_chunks {
+            return None;
+        }
+
+        let workers = self.workers.lock().unwrap();
+        let details = workers
+            .iter()
+            .enumerate()
+            .map(|(idx, worker)| {
+                let age = Instant::now().saturating_duration_since(worker.updated_at);
+                match worker.chunk_index {
+                    Some(chunk_index) => format!(
+                        "worker#{idx}:{stage} chunk={chunk_index} offset={offset} len={len} bytes={bytes} progress_total={progress_total} age={age:?}",
+                        stage = worker.stage,
+                        offset = worker.chunk_offset,
+                        len = worker.chunk_length,
+                        bytes = worker.bytes_in_chunk,
+                        progress_total = worker.last_progress_total,
+                    ),
+                    None => format!("worker#{idx}:idle age={age:?}"),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        Some(format!(
+            "parallel resumable download stalled for {stalled_for:?}: completed_chunks={completed}/{total_chunks}, file_size={file_size}, workers=[{details}]",
+            total_chunks = self.total_chunks,
+            file_size = self.file_size,
+        ))
+    }
+}
+
+async fn run_streaming_watchdog(diagnostics: Arc<StreamingDiagnostics>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(5));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        if let Some(message) = diagnostics.stall_snapshot(Duration::from_secs(5)) {
+            tracing::debug!("{message}");
+        }
+    }
 }
 
 async fn stream_download_worker_to_file(
@@ -412,7 +540,21 @@ async fn stream_download_worker_to_file(
             continue;
         }
 
+        ctx.diagnostics.set_worker_chunk(ctx.worker_id, range);
+        if range.is_tail_of(ctx.diagnostics.file_size) {
+            tracing::debug!(
+                worker_id = ctx.worker_id,
+                chunk_index = range.index,
+                offset = range.offset,
+                length = range.length,
+                file_size = ctx.diagnostics.file_size,
+                "starting tail MEGA range"
+            );
+        }
+
         let url = range.url(&ctx.base_url).parse()?;
+        ctx.diagnostics
+            .set_worker_stage(ctx.worker_id, "http_get", 0);
         let mut response = client.get(url).await?;
         let mut remaining = range.length as usize;
         let mut file_offset = range.offset;
@@ -431,6 +573,18 @@ async fn stream_download_worker_to_file(
                 .into());
             }
 
+            let bytes_in_chunk = range.length.saturating_sub(remaining as u64) + read_len as u64;
+            if range.is_tail_of(ctx.diagnostics.file_size) && bytes_in_chunk == read_len as u64 {
+                tracing::debug!(
+                    worker_id = ctx.worker_id,
+                    chunk_index = range.index,
+                    read_len,
+                    remaining_before = remaining,
+                    "tail MEGA range produced first body bytes"
+                );
+            }
+            ctx.diagnostics
+                .set_worker_stage(ctx.worker_id, "read", bytes_in_chunk);
             let mut chunk = match bytes.try_into_mut() {
                 Ok(bytes) => bytes,
                 Err(bytes) => {
@@ -442,6 +596,8 @@ async fn stream_download_worker_to_file(
             decrypt(&ctx.aes_key, &ctx.aes_iv, file_offset, &mut chunk);
             chunk_mac.update(&chunk);
 
+            ctx.diagnostics
+                .set_worker_stage(ctx.worker_id, "write", bytes_in_chunk);
             tokio::task::block_in_place(|| {
                 write_all_at_blocking(&ctx.std_file, file_offset, &chunk)
             })?;
@@ -449,23 +605,19 @@ async fn stream_download_worker_to_file(
             file_offset += read_len as u64;
             remaining -= read_len;
 
-            if let Some(ref total) = ctx.progress_total {
-                let new_total =
-                    total.fetch_add(read_len as u64, Ordering::Relaxed) + read_len as u64;
-                if let Some(ref reported) = ctx.progress_reported {
-                    let prev = reported.fetch_max(new_total, Ordering::Relaxed);
-                    if new_total > prev {
-                        if let Some(ref cb) = ctx.progress {
-                            cb(new_total);
-                        }
-                    }
-                }
-            }
             if remaining == 0 {
                 break;
             }
         }
 
+        if range.is_tail_of(ctx.diagnostics.file_size) {
+            tracing::debug!(
+                worker_id = ctx.worker_id,
+                chunk_index = range.index,
+                trailing_remaining = remaining,
+                "tail MEGA range body loop ended"
+            );
+        }
         if remaining != 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -478,23 +630,57 @@ async fn stream_download_worker_to_file(
         }
 
         let chunk_index = range.index;
+        if range.is_tail_of(ctx.diagnostics.file_size) {
+            tracing::debug!(
+                worker_id = ctx.worker_id,
+                chunk_index,
+                "tail MEGA chunk finalizing MAC"
+            );
+        }
         let chunk_mac = chunk_mac.finalize();
         ctx.mac.set_chunk_mac(chunk_index as usize, chunk_mac);
 
-        if ctx.durability_available.load(Ordering::Relaxed) {
-            match tokio::task::block_in_place(|| ctx.std_file.sync_data()) {
-                Ok(()) => {
-                    if let Some(ref cb) = ctx.chunk_verified {
-                        cb(chunk_index, chunk_mac);
+        if let Some(ref cb) = ctx.chunk_verified {
+            cb(chunk_index, chunk_mac);
+        }
+        let mut emitted_total = None;
+        if let Some(ref total) = ctx.progress_total {
+            let new_total = total.fetch_add(range.length, Ordering::Relaxed) + range.length;
+            emitted_total = Some(new_total);
+            ctx.diagnostics
+                .set_worker_progress_total(ctx.worker_id, new_total);
+            if new_total.saturating_mul(100) >= ctx.diagnostics.file_size.saturating_mul(90) {
+                tracing::debug!(
+                    worker_id = ctx.worker_id,
+                    chunk_index,
+                    accepted_total = new_total,
+                    file_size = ctx.diagnostics.file_size,
+                    accepted_pct = (new_total as f64 / ctx.diagnostics.file_size as f64) * 100.0,
+                    "accepted MEGA chunk near file end"
+                );
+            }
+            if let Some(ref reported) = ctx.progress_reported {
+                let prev = reported.fetch_max(new_total, Ordering::Relaxed);
+                if new_total > prev {
+                    if let Some(ref cb) = ctx.progress {
+                        cb(new_total);
                     }
-                }
-                Err(_) => {
-                    ctx.durability_available.store(false, Ordering::Relaxed);
                 }
             }
         }
+        if range.is_tail_of(ctx.diagnostics.file_size) {
+            tracing::debug!(
+                worker_id = ctx.worker_id,
+                chunk_index,
+                emitted_total,
+                file_size = ctx.diagnostics.file_size,
+                "tail MEGA chunk accepted"
+            );
+        }
+        ctx.diagnostics.finish_chunk(ctx.worker_id, emitted_total);
     }
 
+    tracing::debug!(worker_id = ctx.worker_id, "MEGA stream worker exited");
     Ok(())
 }
 
@@ -663,6 +849,9 @@ where
             aes_iv_8,
             processor_pool,
             chunk_verified,
+            progress.clone(),
+            progress_total.clone(),
+            progress_reported.clone(),
         )
         .await
     });
@@ -677,9 +866,6 @@ where
                 trusted_chunks: Arc::clone(&trusted_chunks),
                 buffer_pool: Arc::clone(&buffer_pool),
                 tx: tx.clone(),
-                progress: progress.clone(),
-                progress_total: progress_total.clone(),
-                progress_reported: progress_reported.clone(),
             };
             download_worker(client, ctx)
         })
@@ -815,13 +1001,21 @@ pub(crate) async fn download_parallel_resumable_to_file(
     let progress_reported = progress
         .as_ref()
         .map(|_| Arc::new(AtomicU64::new(trusted_bytes)));
-    let durability_available =
-        Arc::new(std::sync::atomic::AtomicBool::new(chunk_verified.is_some()));
     let std_file = Arc::new(writer.into_std().await);
+    let diagnostics = StreamingDiagnostics::new(file_size, untrusted_chunks, num_workers);
+    let watchdog = tokio::spawn(run_streaming_watchdog(Arc::clone(&diagnostics)));
+    tracing::debug!(
+        file_size,
+        trusted_bytes,
+        untrusted_chunks,
+        num_workers,
+        "starting resumable MEGA file download"
+    );
 
     let mut workers = Vec::with_capacity(num_workers);
-    for _ in 0..num_workers {
+    for worker_id in 0..num_workers {
         let ctx = StreamingFileDownloadContext {
+            worker_id,
             base_url: base_url.clone(),
             next_chunk: Arc::clone(&next_chunk),
             chunks: Arc::clone(&chunks),
@@ -835,14 +1029,31 @@ pub(crate) async fn download_parallel_resumable_to_file(
             aes_iv: aes_iv_16,
             aes_iv_8,
             chunk_verified: chunk_verified.clone(),
-            durability_available: Arc::clone(&durability_available),
+            diagnostics: Arc::clone(&diagnostics),
         };
         workers.push(stream_download_worker_to_file(client, ctx));
     }
 
-    futures::future::try_join_all(workers).await?;
+    let result = futures::future::try_join_all(workers).await;
+    tracing::debug!(
+        file_size,
+        trusted_bytes,
+        completed_chunks = diagnostics.completed_chunks.load(Ordering::Relaxed),
+        untrusted_chunks,
+        result = ?result.as_ref().map(|workers| workers.len()),
+        "MEGA stream workers joined"
+    );
+    watchdog.abort();
+    let _ = watchdog.await;
+    result?;
 
+    tracing::debug!(file_size, "finalizing MEGA file MAC");
     let computed_mac = mac.finalize().ok_or(Error::CondensedMacMismatch)?;
+    tracing::debug!(
+        file_size,
+        mac_matches = computed_mac == expected_mac,
+        "finished MEGA file MAC"
+    );
     if computed_mac == expected_mac {
         Ok(())
     } else {
@@ -1461,7 +1672,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chunk_verified_runs_after_sync() {
+    async fn chunk_verified_runs_after_flush_without_sync() {
         let key = [0x42u8; 16];
         let iv = [0x13u8; 16];
         let iv8 = [0x13u8; 8];
@@ -1498,20 +1709,22 @@ mod tests {
             Some(Arc::new(move |_index, _mac| {
                 callback_events_for_cb.lock().unwrap().push("callback");
             })),
+            None,
+            None,
+            None,
         )
         .await
         .unwrap();
 
         assert_eq!(writer.bytes(), plaintext);
-        assert_eq!(writer.sync_calls(), 1);
+        assert_eq!(writer.sync_calls(), 0);
         let writer_journal = writer.journal();
-        let sync_pos = writer_journal.iter().position(|entry| *entry == "sync");
-        assert_eq!(sync_pos, Some(1));
+        assert_eq!(writer_journal.as_slice(), &["flush", "flush"]);
         assert_eq!(callback_events.lock().unwrap().as_slice(), &["callback"]);
     }
 
     #[tokio::test]
-    async fn chunk_verified_is_not_reported_if_sync_fails() {
+    async fn chunk_verified_is_reported_even_if_sync_would_fail() {
         let key = [0x33u8; 16];
         let iv = [0x19u8; 16];
         let iv8 = [0x19u8; 8];
@@ -1549,12 +1762,15 @@ mod tests {
             Some(Arc::new(move |_index, _mac| {
                 *callback_count_for_cb.lock().unwrap() += 1;
             })),
+            None,
+            None,
+            None,
         )
         .await
         .unwrap();
 
         assert_eq!(writer.bytes(), plaintext);
-        assert_eq!(*callback_count.lock().unwrap(), 0);
+        assert_eq!(*callback_count.lock().unwrap(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]

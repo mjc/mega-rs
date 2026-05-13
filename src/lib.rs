@@ -52,9 +52,7 @@ use crate::utils::rsa::RsaPrivateKey;
 
 pub(crate) const DEFAULT_API_ORIGIN: &str = "https://g.api.mega.co.nz/";
 
-async fn collect_http_body(
-    mut body: crate::http::HttpGetStream,
-) -> Result<Vec<u8>> {
+async fn collect_http_body(mut body: crate::http::HttpGetStream) -> Result<Vec<u8>> {
     let mut buffer = Vec::new();
     while let Some(chunk) = body.try_next().await? {
         buffer.extend_from_slice(&chunk);
