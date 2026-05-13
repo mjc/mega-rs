@@ -18,14 +18,13 @@ use async_trait::async_trait;
 use bytes::BytesMut;
 use cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
 use futures::io::Cursor;
-use tokio::sync::mpsc;
-use tokio::io::{AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use futures::TryStreamExt;
+use tokio::io::{AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::mpsc;
 
 use crate::error::{Error, Result};
 use crate::fingerprint::{
-    compute_condensed_mac, compute_mega_chunk_mac, mega_chunk_boundaries, MegaChunk,
-    MegaChunkMac,
+    compute_condensed_mac, compute_mega_chunk_mac, mega_chunk_boundaries, MegaChunk, MegaChunkMac,
     ParallelMacProcessor,
 };
 use crate::http::HttpClient;
@@ -83,17 +82,11 @@ where
         Pin::new(&mut self.get_mut().0).poll_write(cx, buf)
     }
 
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.get_mut().0).poll_flush(cx)
     }
 
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
     }
 }
@@ -280,8 +273,8 @@ async fn download_worker(client: &dyn HttpClient, ctx: DownloadContext) -> Resul
             buffer[bytes_read..end].copy_from_slice(chunk);
             bytes_read = end;
             if let Some(ref total) = ctx.progress_total {
-                let new_total = total.fetch_add(chunk.len() as u64, Ordering::Relaxed)
-                    + chunk.len() as u64;
+                let new_total =
+                    total.fetch_add(chunk.len() as u64, Ordering::Relaxed) + chunk.len() as u64;
                 if let Some(ref reported) = ctx.progress_reported {
                     let prev = reported.fetch_max(new_total, Ordering::Relaxed);
                     if new_total > prev {
@@ -290,6 +283,9 @@ async fn download_worker(client: &dyn HttpClient, ctx: DownloadContext) -> Resul
                         }
                     }
                 }
+            }
+            if bytes_read == target_size {
+                break;
             }
         }
 
@@ -454,7 +450,8 @@ async fn stream_download_worker_to_file(
             remaining -= read_len;
 
             if let Some(ref total) = ctx.progress_total {
-                let new_total = total.fetch_add(read_len as u64, Ordering::Relaxed) + read_len as u64;
+                let new_total =
+                    total.fetch_add(read_len as u64, Ordering::Relaxed) + read_len as u64;
                 if let Some(ref reported) = ctx.progress_reported {
                     let prev = reported.fetch_max(new_total, Ordering::Relaxed);
                     if new_total > prev {
@@ -463,6 +460,9 @@ async fn stream_download_worker_to_file(
                         }
                     }
                 }
+            }
+            if remaining == 0 {
+                break;
             }
         }
 
@@ -815,9 +815,8 @@ pub(crate) async fn download_parallel_resumable_to_file(
     let progress_reported = progress
         .as_ref()
         .map(|_| Arc::new(AtomicU64::new(trusted_bytes)));
-    let durability_available = Arc::new(std::sync::atomic::AtomicBool::new(
-        chunk_verified.is_some(),
-    ));
+    let durability_available =
+        Arc::new(std::sync::atomic::AtomicBool::new(chunk_verified.is_some()));
     let std_file = Arc::new(writer.into_std().await);
 
     let mut workers = Vec::with_capacity(num_workers);
@@ -867,6 +866,8 @@ mod tests {
     use bytes::Bytes;
     use futures::io::AsyncRead;
     use futures::stream;
+    use futures::stream::StreamExt;
+    use tokio::time::{timeout, Duration};
     use url::Url;
 
     use crate::http::{ClientState, HttpClient, HttpGetStream};
@@ -998,10 +999,7 @@ mod tests {
             Poll::Ready(Ok(()))
         }
 
-        fn poll_shutdown(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<std::io::Result<()>> {
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
         }
     }
@@ -1066,6 +1064,16 @@ mod tests {
         }
     }
 
+    struct HangingTailHttpClient {
+        encrypted: Vec<u8>,
+    }
+
+    impl HangingTailHttpClient {
+        fn new(encrypted: Vec<u8>) -> Self {
+            Self { encrypted }
+        }
+    }
+
     #[async_trait]
     impl HttpClient for MockHttpClient {
         async fn send_requests(
@@ -1092,6 +1100,45 @@ mod tests {
             let end_usize = usize::try_from(end).map_err(std::io::Error::other)?;
             let bytes = self.encrypted[start_usize..=end_usize].to_vec();
             Ok(Box::pin(stream::iter([Ok(Bytes::from(bytes))])))
+        }
+
+        async fn post(
+            &self,
+            _url: Url,
+            _body: Pin<Box<dyn AsyncRead + Send + Sync>>,
+            _content_length: Option<u64>,
+        ) -> Result<Pin<Box<dyn AsyncRead + Send>>> {
+            unreachable!("resumable tests do not upload data")
+        }
+    }
+
+    #[async_trait]
+    impl HttpClient for HangingTailHttpClient {
+        async fn send_requests(
+            &self,
+            _state: &ClientState,
+            _requests: &[Request],
+            _query_params: &[(&str, &str)],
+        ) -> Result<Vec<Response>> {
+            unreachable!("resumable tests call the lower-level downloader directly")
+        }
+
+        async fn get(&self, url: Url) -> Result<HttpGetStream> {
+            let range = url
+                .path_segments()
+                .and_then(Iterator::last)
+                .ok_or_else(|| std::io::Error::other("missing range"))?;
+            let (start, end) = range
+                .split_once('-')
+                .ok_or_else(|| std::io::Error::other("bad range"))?;
+            let start = start.parse::<u64>().map_err(std::io::Error::other)?;
+            let end = end.parse::<u64>().map_err(std::io::Error::other)?;
+            let start_usize = usize::try_from(start).map_err(std::io::Error::other)?;
+            let end_usize = usize::try_from(end).map_err(std::io::Error::other)?;
+            let bytes = self.encrypted[start_usize..=end_usize].to_vec();
+            let stream = stream::iter([Ok::<Bytes, std::io::Error>(Bytes::from(bytes))])
+                .chain(stream::pending::<std::io::Result<Bytes>>());
+            Ok(Box::pin(stream))
         }
 
         async fn post(
@@ -1508,5 +1555,52 @@ mod tests {
 
         assert_eq!(writer.bytes(), plaintext);
         assert_eq!(*callback_count.lock().unwrap(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resumable_streaming_download_does_not_wait_for_http_eof_after_full_range() {
+        let fixture = resumable_fixture(800_000);
+        let http = HangingTailHttpClient::new(fixture.encrypted.clone());
+        let path = std::env::temp_dir().join(format!(
+            "mega-parallel-hanging-tail-{}-{}.part",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .read(true)
+            .open(&path)
+            .await
+            .unwrap();
+        file.set_len(fixture.plaintext.len() as u64).await.unwrap();
+
+        timeout(
+            Duration::from_secs(2),
+            download_parallel_resumable_to_file(
+                &http,
+                &fixture.node,
+                "http://example.test/file".to_string(),
+                fixture.plaintext.len() as u64,
+                file,
+                3,
+                None,
+                None,
+                None,
+                *fixture.node.aes_iv.as_ref().unwrap(),
+                *fixture.node.condensed_mac.as_ref().unwrap(),
+            ),
+        )
+        .await
+        .expect("download should finish without waiting for stream EOF")
+        .unwrap();
+
+        let bytes = tokio::fs::read(&path).await.unwrap();
+        let _ = tokio::fs::remove_file(&path).await;
+        assert_eq!(bytes, fixture.plaintext);
     }
 }
