@@ -24,6 +24,7 @@ use futures::AsyncReadExt;
 use crate::error::{Error, Result};
 use crate::fingerprint::{
     compute_condensed_mac, compute_mega_chunk_mac, mega_chunk_boundaries, MegaChunk,
+    MegaChunkMac,
     ParallelMacProcessor,
 };
 use crate::http::HttpClient;
@@ -372,6 +373,99 @@ where
     Ok(())
 }
 
+struct StreamingFileDownloadContext {
+    base_url: String,
+    next_chunk: Arc<AtomicU64>,
+    chunks: Arc<[MegaChunk]>,
+    trusted_chunks: Arc<[Option<[u8; 16]>]>,
+    std_file: Arc<StdFile>,
+    progress: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+    progress_total: Option<Arc<AtomicU64>>,
+    progress_reported: Option<Arc<AtomicU64>>,
+    mac: Arc<ParallelMacProcessor>,
+    aes_key: [u8; 16],
+    aes_iv: [u8; 16],
+    aes_iv_8: [u8; 8],
+    chunk_verified: Option<Arc<dyn Fn(u32, [u8; 16]) + Send + Sync>>,
+    durability_available: Arc<std::sync::atomic::AtomicBool>,
+}
+
+async fn stream_download_worker_to_file(
+    client: &dyn HttpClient,
+    ctx: StreamingFileDownloadContext,
+) -> Result<()> {
+    const STREAM_BUFFER_SIZE: usize = 128 * 1024;
+
+    let mut buffer = vec![0u8; STREAM_BUFFER_SIZE];
+
+    loop {
+        let idx = ctx.next_chunk.fetch_add(1, Ordering::Relaxed);
+        let Some(range) = ctx.chunks.get(idx as usize).copied() else {
+            break;
+        };
+        if ctx
+            .trusted_chunks
+            .get(idx as usize)
+            .is_some_and(Option::is_some)
+        {
+            continue;
+        }
+
+        let url = range.url(&ctx.base_url).parse()?;
+        let mut response = client.get(url).await?;
+        let mut remaining = range.length as usize;
+        let mut file_offset = range.offset;
+        let mut chunk_mac = MegaChunkMac::new(&ctx.aes_key, &ctx.aes_iv_8);
+
+        while remaining > 0 {
+            let read_len = remaining.min(buffer.len());
+            response.read_exact(&mut buffer[..read_len]).await?;
+
+            let chunk = &mut buffer[..read_len];
+            decrypt(&ctx.aes_key, &ctx.aes_iv, file_offset, chunk);
+            chunk_mac.update(chunk);
+
+            tokio::task::block_in_place(|| {
+                write_all_at_blocking(&ctx.std_file, file_offset, chunk)
+            })?;
+
+            file_offset += read_len as u64;
+            remaining -= read_len;
+
+            if let Some(ref total) = ctx.progress_total {
+                let new_total = total.fetch_add(read_len as u64, Ordering::Relaxed) + read_len as u64;
+                if let Some(ref reported) = ctx.progress_reported {
+                    let prev = reported.fetch_max(new_total, Ordering::Relaxed);
+                    if new_total > prev {
+                        if let Some(ref cb) = ctx.progress {
+                            cb(new_total);
+                        }
+                    }
+                }
+            }
+        }
+
+        let chunk_index = range.index;
+        let chunk_mac = chunk_mac.finalize();
+        ctx.mac.set_chunk_mac(chunk_index as usize, chunk_mac);
+
+        if ctx.durability_available.load(Ordering::Relaxed) {
+            match tokio::task::block_in_place(|| ctx.std_file.sync_data()) {
+                Ok(()) => {
+                    if let Some(ref cb) = ctx.chunk_verified {
+                        cb(chunk_index, chunk_mac);
+                    }
+                }
+                Err(_) => {
+                    ctx.durability_available.store(false, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 // ============================================================================
 // Main entry point
 // ============================================================================
@@ -584,6 +678,140 @@ where
     // Finalize MAC
     let computed_mac = mac.finalize().ok_or(Error::CondensedMacMismatch)?;
 
+    if computed_mac == expected_mac {
+        Ok(())
+    } else {
+        Err(Error::CondensedMacMismatch)
+    }
+}
+
+pub(crate) async fn download_parallel_resumable_to_file(
+    client: &dyn HttpClient,
+    node: &Node,
+    base_url: String,
+    server_size: u64,
+    writer: tokio::fs::File,
+    num_connections: usize,
+    progress_callback: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+    trusted_chunks: Option<Arc<[Option<[u8; 16]>]>>,
+    chunk_verified: Option<Arc<dyn Fn(u32, [u8; 16]) + Send + Sync>>,
+    aes_iv: [u8; 8],
+    expected_mac: [u8; 8],
+) -> Result<()> {
+    if !node.kind.is_file() {
+        return Err(Error::NotAFileNode);
+    }
+
+    let file_size = server_size;
+    let aes_key = node.aes_key;
+    let aes_iv_8 = aes_iv;
+
+    if file_size == 0 {
+        if let Some(cb) = progress_callback {
+            cb(0);
+        }
+
+        let empty_mac =
+            compute_condensed_mac(Cursor::new(Vec::new()), 0, &aes_key, &aes_iv_8).await?;
+
+        return if empty_mac == expected_mac {
+            Ok(())
+        } else {
+            Err(Error::CondensedMacMismatch)
+        };
+    }
+
+    let mut aes_iv_16 = [0u8; 16];
+    aes_iv_16[..8].copy_from_slice(&aes_iv_8);
+
+    let chunks = Arc::<[MegaChunk]>::from(mega_chunk_boundaries(file_size));
+    let num_chunks = chunks.len() as u64;
+    let trusted_chunks = trusted_chunks.unwrap_or_else(|| {
+        std::iter::repeat_with(|| None)
+            .take(num_chunks as usize)
+            .collect::<Vec<_>>()
+            .into()
+    });
+    let trusted_bytes = chunks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, chunk)| {
+            trusted_chunks
+                .get(index)
+                .and_then(Option::as_ref)
+                .map(|_| chunk.length)
+        })
+        .sum::<u64>();
+    let requested_workers = num_connections.max(1);
+    if requested_workers > MAX_PARALLEL_WORKERS {
+        return Err(Error::ParallelismTooHigh);
+    }
+    let untrusted_chunks = num_chunks as usize
+        - trusted_chunks
+            .iter()
+            .take(num_chunks as usize)
+            .filter(|entry| entry.is_some())
+            .count();
+
+    let mac = Arc::new(ParallelMacProcessor::new(file_size, &aes_key, &aes_iv_8));
+    for (index, entry) in trusted_chunks.iter().take(num_chunks as usize).enumerate() {
+        if let Some(chunk_mac) = entry {
+            mac.set_chunk_mac(index, *chunk_mac);
+        }
+    }
+
+    let progress: Option<Arc<dyn Fn(u64) + Send + Sync>> = progress_callback;
+    if trusted_bytes > 0 {
+        if let Some(ref cb) = progress {
+            cb(trusted_bytes);
+        }
+    }
+    if untrusted_chunks == 0 {
+        let computed_mac = mac.finalize().ok_or(Error::CondensedMacMismatch)?;
+        return if computed_mac == expected_mac {
+            Ok(())
+        } else {
+            Err(Error::CondensedMacMismatch)
+        };
+    }
+
+    let num_workers = requested_workers.min(untrusted_chunks);
+    let next_chunk = Arc::new(AtomicU64::new(0));
+    let progress_total = progress
+        .as_ref()
+        .map(|_| Arc::new(AtomicU64::new(trusted_bytes)));
+    let progress_reported = progress
+        .as_ref()
+        .map(|_| Arc::new(AtomicU64::new(trusted_bytes)));
+    let durability_available = Arc::new(std::sync::atomic::AtomicBool::new(
+        chunk_verified.is_some(),
+    ));
+    let std_file = Arc::new(writer.into_std().await);
+
+    let mut workers = Vec::with_capacity(num_workers);
+    for _ in 0..num_workers {
+        let ctx = StreamingFileDownloadContext {
+            base_url: base_url.clone(),
+            next_chunk: Arc::clone(&next_chunk),
+            chunks: Arc::clone(&chunks),
+            trusted_chunks: Arc::clone(&trusted_chunks),
+            std_file: Arc::clone(&std_file),
+            progress: progress.clone(),
+            progress_total: progress_total.clone(),
+            progress_reported: progress_reported.clone(),
+            mac: Arc::clone(&mac),
+            aes_key,
+            aes_iv: aes_iv_16,
+            aes_iv_8,
+            chunk_verified: chunk_verified.clone(),
+            durability_available: Arc::clone(&durability_available),
+        };
+        workers.push(stream_download_worker_to_file(client, ctx));
+    }
+
+    futures::future::try_join_all(workers).await?;
+
+    let computed_mac = mac.finalize().ok_or(Error::CondensedMacMismatch)?;
     if computed_mac == expected_mac {
         Ok(())
     } else {
@@ -1095,6 +1323,60 @@ mod tests {
             Some(fixture.plaintext.len() as u64)
         );
         assert!(progress.windows(2).all(|window| window[1] > window[0]));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resumable_streaming_file_path_writes_complete_plaintext() {
+        let fixture = resumable_fixture(800_000);
+        let trusted = trusted_chunk_macs(&fixture, &[1]);
+        let http = MockHttpClient::new(fixture.encrypted.clone());
+        let path = std::env::temp_dir().join(format!(
+            "mega-parallel-test-{}-{}.part",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .read(true)
+            .open(&path)
+            .await
+            .unwrap();
+        file.set_len(fixture.plaintext.len() as u64).await.unwrap();
+        let std_file = file.try_clone().await.unwrap().into_std().await;
+        for (index, mac) in trusted.iter().enumerate() {
+            if mac.is_some() {
+                let chunk = fixture.chunks[index];
+                let start = chunk.offset as usize;
+                let end = (chunk.offset + chunk.length) as usize;
+                write_all_at_blocking(&std_file, chunk.offset, &fixture.plaintext[start..end])
+                    .unwrap();
+            }
+        }
+
+        download_parallel_resumable_to_file(
+            &http,
+            &fixture.node,
+            "http://example.test/file".to_string(),
+            fixture.plaintext.len() as u64,
+            file,
+            3,
+            None,
+            Some(trusted.into()),
+            None,
+            *fixture.node.aes_iv.as_ref().unwrap(),
+            *fixture.node.condensed_mac.as_ref().unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let bytes = tokio::fs::read(&path).await.unwrap();
+        let _ = tokio::fs::remove_file(&path).await;
+        assert_eq!(bytes, fixture.plaintext);
     }
 
     #[tokio::test]

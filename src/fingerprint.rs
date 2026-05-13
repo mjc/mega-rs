@@ -511,6 +511,70 @@ pub fn compute_mega_chunk_mac(data: &[u8], aes_key: &[u8; 16], aes_iv: &[u8; 8])
     compute_chunk_mac_inner(aes_key, &aes_iv_full, data)
 }
 
+#[cfg(feature = "parallel")]
+pub struct MegaChunkMac {
+    aes: Aes128,
+    cur_mac: [u8; 16],
+    partial: [u8; 16],
+    partial_len: usize,
+}
+
+#[cfg(feature = "parallel")]
+impl MegaChunkMac {
+    #[must_use]
+    pub fn new(aes_key: &[u8; 16], aes_iv: &[u8; 8]) -> Self {
+        let mut aes_iv_full = [0u8; 16];
+        aes_iv_full[..8].copy_from_slice(aes_iv);
+        aes_iv_full[8..].copy_from_slice(aes_iv);
+        Self {
+            aes: Aes128::new(aes_key.into()),
+            cur_mac: aes_iv_full,
+            partial: [0u8; 16],
+            partial_len: 0,
+        }
+    }
+
+    pub fn update(&mut self, mut data: &[u8]) {
+        if self.partial_len > 0 {
+            let needed = 16 - self.partial_len;
+            let take = needed.min(data.len());
+            self.partial[self.partial_len..self.partial_len + take].copy_from_slice(&data[..take]);
+            self.partial_len += take;
+            data = &data[take..];
+            if self.partial_len == 16 {
+                encrypt_cbc_block(&self.aes, &mut self.cur_mac, &self.partial);
+                self.partial = [0u8; 16];
+                self.partial_len = 0;
+            }
+        }
+
+        let mut blocks = data.chunks_exact(16);
+        for block in &mut blocks {
+            encrypt_cbc_block(
+                &self.aes,
+                &mut self.cur_mac,
+                block.try_into().expect("16-byte block"),
+            );
+        }
+
+        let leftover = blocks.remainder();
+        if !leftover.is_empty() {
+            self.partial[..leftover.len()].copy_from_slice(leftover);
+            self.partial_len = leftover.len();
+        }
+    }
+
+    #[must_use]
+    pub fn finalize(mut self) -> [u8; 16] {
+        if self.partial_len > 0 {
+            let mut padded = [0u8; 16];
+            padded[..self.partial_len].copy_from_slice(&self.partial[..self.partial_len]);
+            encrypt_cbc_block(&self.aes, &mut self.cur_mac, &padded);
+        }
+        self.cur_mac
+    }
+}
+
 fn compute_chunk_mac_with_cipher(
     aes: &Aes128,
     aes_iv: &[u8; 16],

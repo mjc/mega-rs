@@ -1339,6 +1339,42 @@ impl Client {
         .await
     }
 
+    #[cfg(feature = "parallel")]
+    pub async fn download_node_parallel_to_file_with_progress<F>(
+        &self,
+        node: &Node,
+        writer: tokio::fs::File,
+        num_connections: usize,
+        progress: Option<F>,
+    ) -> Result<()>
+    where
+        F: Fn(u64) + Send + Sync + 'static,
+    {
+        if !node.kind.is_file() {
+            return Err(Error::NotAFileNode);
+        }
+
+        let aes_iv = node.aes_iv.ok_or(Error::MissingNodeAesIv)?;
+        let expected_mac = node.condensed_mac.ok_or(Error::MissingCondensedMac)?;
+
+        let (base_url, server_size) = self.get_download_url(node).await?;
+        let progress = progress.map(|cb| Arc::new(cb) as Arc<dyn Fn(u64) + Send + Sync>);
+        parallel::download_parallel_resumable_to_file(
+            &*self.client,
+            node,
+            base_url,
+            server_size,
+            writer,
+            num_connections,
+            progress,
+            None,
+            None,
+            aes_iv,
+            expected_mac,
+        )
+        .await
+    }
+
     /// Downloads a file using multiple parallel connections, skipping
     /// prevalidated plaintext MEGA chunks.
     ///
@@ -1375,6 +1411,48 @@ impl Client {
         let chunk_verified =
             chunk_verified.map(|cb| Arc::new(cb) as Arc<dyn Fn(u32, [u8; 16]) + Send + Sync>);
         parallel::download_parallel_resumable(
+            &*self.client,
+            node,
+            base_url,
+            server_size,
+            writer,
+            num_connections,
+            progress,
+            Some(trusted_chunks),
+            chunk_verified,
+            aes_iv,
+            expected_mac,
+        )
+        .await
+    }
+
+    #[cfg(feature = "parallel")]
+    pub async fn download_node_parallel_resumable_to_file_with_progress<F, C>(
+        &self,
+        node: &Node,
+        writer: tokio::fs::File,
+        num_connections: usize,
+        trusted_chunks: &[Option<[u8; 16]>],
+        progress: Option<F>,
+        chunk_verified: Option<C>,
+    ) -> Result<()>
+    where
+        F: Fn(u64) + Send + Sync + 'static,
+        C: Fn(u32, [u8; 16]) + Send + Sync + 'static,
+    {
+        if !node.kind.is_file() {
+            return Err(Error::NotAFileNode);
+        }
+
+        let aes_iv = node.aes_iv.ok_or(Error::MissingNodeAesIv)?;
+        let expected_mac = node.condensed_mac.ok_or(Error::MissingCondensedMac)?;
+
+        let (base_url, server_size) = self.get_download_url(node).await?;
+        let progress = progress.map(|cb| Arc::new(cb) as Arc<dyn Fn(u64) + Send + Sync>);
+        let trusted_chunks: Arc<[Option<[u8; 16]>]> = trusted_chunks.to_vec().into();
+        let chunk_verified =
+            chunk_verified.map(|cb| Arc::new(cb) as Arc<dyn Fn(u32, [u8; 16]) + Send + Sync>);
+        parallel::download_parallel_resumable_to_file(
             &*self.client,
             node,
             base_url,
