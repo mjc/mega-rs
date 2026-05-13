@@ -5,6 +5,8 @@
 //! - Processor (single): decrypt, write, update MAC
 //! - Uses ParallelMacProcessor for out-of-order MAC computation
 
+use std::fs::File as StdFile;
+use std::io;
 use std::io::SeekFrom;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,6 +35,12 @@ const MAX_PARALLEL_WORKERS: usize = 16;
 #[async_trait]
 pub trait ParallelDownloadWriter: AsyncWrite + AsyncSeek + Unpin + Send {
     async fn sync_data(&mut self) -> std::io::Result<()>;
+
+    async fn write_chunk(&mut self, offset: u64, data: Vec<u8>) -> std::io::Result<Vec<u8>> {
+        self.seek(SeekFrom::Start(offset)).await?;
+        self.write_all(&data).await?;
+        Ok(data)
+    }
 }
 
 #[cfg(feature = "reqwest")]
@@ -40,6 +48,16 @@ pub trait ParallelDownloadWriter: AsyncWrite + AsyncSeek + Unpin + Send {
 impl ParallelDownloadWriter for tokio::fs::File {
     async fn sync_data(&mut self) -> std::io::Result<()> {
         tokio::fs::File::sync_data(self).await
+    }
+
+    async fn write_chunk(&mut self, offset: u64, data: Vec<u8>) -> std::io::Result<Vec<u8>> {
+        let std_file = self.try_clone().await?.into_std().await;
+        tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
+            write_all_at_blocking(&std_file, offset, &data)?;
+            Ok(data)
+        })
+        .await
+        .map_err(|e| std::io::Error::other(format!("positioned write task failed: {e}")))?
     }
 }
 
@@ -160,6 +178,44 @@ fn decrypt(key: &[u8; 16], iv: &[u8; 16], offset: u64, data: &mut [u8]) {
     let mut cipher = ctr::Ctr128BE::<Aes128>::new(key.into(), iv.into());
     cipher.seek(offset);
     cipher.apply_keystream(data);
+}
+
+#[cfg(unix)]
+fn write_all_at_blocking(file: &StdFile, mut offset: u64, mut data: &[u8]) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+
+    while !data.is_empty() {
+        let written = file.write_at(data, offset)?;
+        if written == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "failed to write download chunk",
+            ));
+        }
+        offset = offset.saturating_add(written as u64);
+        data = &data[written..];
+    }
+
+    Ok(())
+}
+
+#[cfg(windows)]
+fn write_all_at_blocking(file: &StdFile, mut offset: u64, mut data: &[u8]) -> io::Result<()> {
+    use std::os::windows::fs::FileExt;
+
+    while !data.is_empty() {
+        let written = file.seek_write(data, offset)?;
+        if written == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "failed to write download chunk",
+            ));
+        }
+        offset = offset.saturating_add(written as u64);
+        data = &data[written..];
+    }
+
+    Ok(())
 }
 
 // ============================================================================
@@ -290,9 +346,8 @@ where
         let mut data = decrypted.1;
         mac.set_chunk_mac(chunk_index as usize, chunk_mac);
 
-        // Write to file
-        writer.seek(SeekFrom::Start(offset)).await?;
-        writer.write_all(&data).await?;
+        // File-backed writers can bypass Tokio's buffered async file adapter here.
+        data = writer.write_chunk(offset, data).await?;
         if durability_available {
             writer.flush().await?;
             match writer.sync_data().await {
