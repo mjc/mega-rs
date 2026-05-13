@@ -13,7 +13,7 @@ use tokio_util::compat::FuturesAsyncReadCompatExt;
 use url::Url;
 
 use crate::error::{Error, Result};
-use crate::http::HttpClient;
+use crate::http::{HttpClient, HttpGetStream};
 use crate::protocol::commands::{Request, Response};
 use crate::{ClientState, ErrorCode};
 
@@ -130,7 +130,7 @@ impl HttpClient for reqwest::Client {
         Err(Error::MaxRetriesReached)
     }
 
-    async fn get(&self, url: Url) -> Result<Pin<Box<dyn AsyncRead + Send>>> {
+    async fn get(&self, url: Url) -> Result<HttpGetStream> {
         let stream = self
             .get(url)
             .send()
@@ -139,7 +139,7 @@ impl HttpClient for reqwest::Client {
             .bytes_stream()
             .map_err(|err| io::Error::new(io::ErrorKind::Other, err));
 
-        Ok(Box::pin(stream.into_async_read()))
+        Ok(Box::pin(stream))
     }
 
     async fn post(

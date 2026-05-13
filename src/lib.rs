@@ -10,6 +10,7 @@ use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use cipher::generic_array::GenericArray;
 use cipher::{BlockDecryptMut, BlockEncrypt, BlockEncryptMut, KeyInit, KeyIvInit, StreamCipher};
 use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, Cursor};
+use futures::TryStreamExt;
 use hmac::{Hmac, Mac};
 use pbkdf2::pbkdf2_hmac_array;
 use secrecy::{ExposeSecret, SecretBox};
@@ -50,6 +51,16 @@ use crate::protocol::{FILE_KEY_SIZE, FOLDER_KEY_SIZE, USER_KEY_SIZE, USER_SID_SI
 use crate::utils::rsa::RsaPrivateKey;
 
 pub(crate) const DEFAULT_API_ORIGIN: &str = "https://g.api.mega.co.nz/";
+
+async fn collect_http_body(
+    mut body: crate::http::HttpGetStream,
+) -> Result<Vec<u8>> {
+    let mut buffer = Vec::new();
+    while let Some(chunk) = body.try_next().await? {
+        buffer.extend_from_slice(&chunk);
+    }
+    Ok(buffer)
+}
 
 /// A builder to initialize a [`Client`] instance.
 pub struct ClientBuilder {
@@ -1189,7 +1200,7 @@ impl Client {
         }
         let url = Url::parse(&format!("{base_url}/0-{}", size - 1))?;
 
-        let mut reader = self.client.get(url).await?.take(size);
+        let mut body = self.client.get(url).await?;
 
         let mut file_iv = [0u8; 16];
 
@@ -1200,40 +1211,20 @@ impl Client {
 
         // Progress tracking
         let download_future = async move {
-            let mut chunk_size: u64 = 131_072; // 2^17
             let mut total_written = 0u64;
-
-            let mut buffer = {
-                let chunk_size = usize::try_from(chunk_size).unwrap();
-                Vec::with_capacity(chunk_size)
-            };
 
             futures::pin_mut!(writer);
             futures::pin_mut!(condensed_mac_writer);
 
-            loop {
-                buffer.clear();
-
-                let bytes_read = (&mut reader)
-                    .take(chunk_size)
-                    .read_to_end(&mut buffer)
-                    .await?;
-
-                if bytes_read == 0 {
-                    break;
-                }
-
+            while let Some(chunk) = body.try_next().await? {
+                let mut buffer = chunk.to_vec();
                 ctr.apply_keystream(&mut buffer);
                 writer.write_all(&buffer).await?;
                 condensed_mac_writer.write_all(&buffer).await?;
 
-                total_written += bytes_read as u64;
+                total_written += buffer.len() as u64;
                 if let Some(ref cb) = progress {
                     cb(total_written);
-                }
-
-                if chunk_size < 1_048_576 {
-                    chunk_size += 131_072;
                 }
             }
 
@@ -2023,10 +2014,7 @@ impl Client {
                 }
             }
 
-            let mut response = self.client.get(url.clone()).await?;
-
-            let mut buffer = Vec::default();
-            response.read_to_end(&mut buffer).await?;
+            let buffer = collect_http_body(self.client.get(url.clone()).await?).await?;
 
             let value: json::Value = json::from_slice(&buffer)?;
             if value.is_number() {
@@ -2137,7 +2125,7 @@ impl Client {
             match response {
                 EventBatchResponse::Wait(response) => {
                     let wait_url = Url::parse(&response.wait_url)?;
-                    self.client.get(wait_url).await?;
+                    let _ = self.client.get(wait_url).await?;
                 }
                 EventBatchResponse::Ready(response) => {
                     break response;

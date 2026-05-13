@@ -15,11 +15,12 @@ use std::task::{Context, Poll};
 
 use aes::Aes128;
 use async_trait::async_trait;
+use bytes::BytesMut;
 use cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
 use futures::io::Cursor;
 use tokio::sync::mpsc;
 use tokio::io::{AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
-use futures::AsyncReadExt;
+use futures::TryStreamExt;
 
 use crate::error::{Error, Result};
 use crate::fingerprint::{
@@ -263,36 +264,44 @@ async fn download_worker(client: &dyn HttpClient, ctx: DownloadContext) -> Resul
         let mut response = client.get(url).await?;
         let mut bytes_read = 0;
 
-        while bytes_read < target_size {
-            match response.read(&mut buffer[bytes_read..]).await? {
-                0 => {
-                    // EOF before reaching expected bytes
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        format!(
-                            "unexpected EOF while reading HTTP chunk: expected {} bytes, got {} bytes",
-                            range.length, bytes_read
-                        ),
-                    )
-                    .into());
-                }
-                n => {
-                    bytes_read += n;
-                    if let Some(ref total) = ctx.progress_total {
-                        let new_total = total.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
-                        // Only invoke callback if we advanced the high-water mark,
-                        // ensuring monotonic progress reporting across workers.
-                        if let Some(ref reported) = ctx.progress_reported {
-                            let prev = reported.fetch_max(new_total, Ordering::Relaxed);
-                            if new_total > prev {
-                                if let Some(ref cb) = ctx.progress {
-                                    cb(new_total);
-                                }
-                            }
+        while let Some(chunk) = response.try_next().await? {
+            let chunk = chunk.as_ref();
+            let end = bytes_read + chunk.len();
+            if end > target_size {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "HTTP chunk exceeded expected MEGA range: expected {} bytes, got at least {} bytes",
+                        range.length, end
+                    ),
+                )
+                .into());
+            }
+            buffer[bytes_read..end].copy_from_slice(chunk);
+            bytes_read = end;
+            if let Some(ref total) = ctx.progress_total {
+                let new_total = total.fetch_add(chunk.len() as u64, Ordering::Relaxed)
+                    + chunk.len() as u64;
+                if let Some(ref reported) = ctx.progress_reported {
+                    let prev = reported.fetch_max(new_total, Ordering::Relaxed);
+                    if new_total > prev {
+                        if let Some(ref cb) = ctx.progress {
+                            cb(new_total);
                         }
                     }
                 }
             }
+        }
+
+        if bytes_read < target_size {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!(
+                    "unexpected EOF while reading HTTP chunk: expected {} bytes, got {} bytes",
+                    range.length, bytes_read
+                ),
+            )
+            .into());
         }
 
         let chunk = DownloadedChunk {
@@ -394,10 +403,6 @@ async fn stream_download_worker_to_file(
     client: &dyn HttpClient,
     ctx: StreamingFileDownloadContext,
 ) -> Result<()> {
-    const STREAM_BUFFER_SIZE: usize = 128 * 1024;
-
-    let mut buffer = vec![0u8; STREAM_BUFFER_SIZE];
-
     loop {
         let idx = ctx.next_chunk.fetch_add(1, Ordering::Relaxed);
         let Some(range) = ctx.chunks.get(idx as usize).copied() else {
@@ -417,16 +422,32 @@ async fn stream_download_worker_to_file(
         let mut file_offset = range.offset;
         let mut chunk_mac = MegaChunkMac::new(&ctx.aes_key, &ctx.aes_iv_8);
 
-        while remaining > 0 {
-            let read_len = remaining.min(buffer.len());
-            response.read_exact(&mut buffer[..read_len]).await?;
+        while let Some(bytes) = response.try_next().await? {
+            let read_len = bytes.len();
+            if read_len > remaining {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "HTTP chunk exceeded expected MEGA range: expected {} bytes remaining, got {} bytes",
+                        remaining, read_len
+                    ),
+                )
+                .into());
+            }
 
-            let chunk = &mut buffer[..read_len];
-            decrypt(&ctx.aes_key, &ctx.aes_iv, file_offset, chunk);
-            chunk_mac.update(chunk);
+            let mut chunk = match bytes.try_into_mut() {
+                Ok(bytes) => bytes,
+                Err(bytes) => {
+                    let mut buf = BytesMut::with_capacity(bytes.len());
+                    buf.extend_from_slice(&bytes);
+                    buf
+                }
+            };
+            decrypt(&ctx.aes_key, &ctx.aes_iv, file_offset, &mut chunk);
+            chunk_mac.update(&chunk);
 
             tokio::task::block_in_place(|| {
-                write_all_at_blocking(&ctx.std_file, file_offset, chunk)
+                write_all_at_blocking(&ctx.std_file, file_offset, &chunk)
             })?;
 
             file_offset += read_len as u64;
@@ -443,6 +464,17 @@ async fn stream_download_worker_to_file(
                     }
                 }
             }
+        }
+
+        if remaining != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!(
+                    "unexpected EOF while reading HTTP chunk: expected {} trailing bytes",
+                    remaining
+                ),
+            )
+            .into());
         }
 
         let chunk_index = range.index;
@@ -832,10 +864,12 @@ mod tests {
     use std::task::{Context, Poll};
 
     use async_trait::async_trait;
+    use bytes::Bytes;
     use futures::io::AsyncRead;
+    use futures::stream;
     use url::Url;
 
-    use crate::http::{ClientState, HttpClient};
+    use crate::http::{ClientState, HttpClient, HttpGetStream};
     use crate::protocol::commands::{Request, Response};
 
     #[test]
@@ -1043,7 +1077,7 @@ mod tests {
             unreachable!("resumable tests call the lower-level downloader directly")
         }
 
-        async fn get(&self, url: Url) -> Result<Pin<Box<dyn AsyncRead + Send>>> {
+        async fn get(&self, url: Url) -> Result<HttpGetStream> {
             let range = url
                 .path_segments()
                 .and_then(Iterator::last)
@@ -1057,7 +1091,7 @@ mod tests {
             let start_usize = usize::try_from(start).map_err(std::io::Error::other)?;
             let end_usize = usize::try_from(end).map_err(std::io::Error::other)?;
             let bytes = self.encrypted[start_usize..=end_usize].to_vec();
-            Ok(Box::pin(Cursor::new(bytes)))
+            Ok(Box::pin(stream::iter([Ok(Bytes::from(bytes))])))
         }
 
         async fn post(
