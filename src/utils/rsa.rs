@@ -26,7 +26,7 @@ impl RsaPrivateKey {
 
     pub fn decrypt(&self, data: &[u8]) -> Vec<u8> {
         let m = rsa::BigUint::from_bytes_be(data);
-        decrypt_rsa(&m, &self.p, &self.q, &self.d).to_bytes_be()
+        decrypt_rsa(&m, &self.p, &self.q, &self.d, &self.u).to_bytes_be()
     }
 }
 
@@ -47,7 +47,32 @@ pub(crate) fn decrypt_rsa(
     p: &rsa::BigUint,
     q: &rsa::BigUint,
     d: &rsa::BigUint,
+    u: &rsa::BigUint,
 ) -> rsa::BigUint {
-    let n = p * q;
-    m.modpow(d, &n)
+    let one = rsa::BigUint::from(1u8);
+    let xp = (m % p).modpow(&(d % (p - &one)), p);
+    let xq = (m % q).modpow(&(d % (q - &one)), q);
+    let t = if xq >= xp {
+        (&xq - &xp) * u % q
+    } else {
+        q - (((&xp - &xq) * u) % q)
+    };
+    t * p + xp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crt_decrypt_matches_direct_modpow() {
+        let p = rsa::BigUint::from(61u8);
+        let q = rsa::BigUint::from(53u8);
+        let d = rsa::BigUint::from(2753u16);
+        let u = rsa::BigUint::from(20u8);
+        let ciphertext = rsa::BigUint::from(2790u16);
+        let direct = ciphertext.modpow(&d, &(&p * &q));
+
+        assert_eq!(decrypt_rsa(&ciphertext, &p, &q, &d, &u), direct);
+    }
 }
