@@ -1226,6 +1226,15 @@ impl Client {
                 }
             }
 
+            if total_written != size {
+                return Err(Error::from(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "unexpected EOF while reading download body: expected {size} bytes, got {total_written} bytes"
+                    ),
+                )));
+            }
+
             Ok(())
         };
 

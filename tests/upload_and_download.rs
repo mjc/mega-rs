@@ -172,32 +172,37 @@ async fn upload_and_parallel_download_test() {
     let progress_bytes = Arc::new(AtomicU64::new(0));
     let progress_clone = Arc::clone(&progress_bytes);
 
-    mega.download_node_parallel_with_progress(
-        node,
-        file,
-        4,
-        Some(move |bytes: u64| {
-            progress_clone.fetch_max(bytes, Ordering::Relaxed);
-        }),
-    )
-    .await
-    .expect("could not parallel-download test file");
+    let test_result: mega::Result<()> = async {
+        mega.download_node_parallel_with_progress(
+            node,
+            file,
+            4,
+            Some(move |bytes: u64| {
+                progress_clone.fetch_max(bytes, Ordering::Relaxed);
+            }),
+        )
+        .await?;
 
-    // Read back and verify contents match
-    let downloaded = tokio::fs::read(&temp_path)
-        .await
-        .expect("could not read back temp file");
-    assert_eq!(uploaded.as_bytes(), downloaded.as_slice());
+        let downloaded = tokio::fs::read(&temp_path).await?;
+        if uploaded.as_bytes() != downloaded.as_slice() {
+            return Err(std::io::Error::other("parallel download contents differed").into());
+        }
 
-    // Verify progress callback was invoked with the total file size
-    assert_eq!(progress_bytes.load(Ordering::Relaxed), size as u64);
+        let reported = progress_bytes.load(Ordering::Relaxed);
+        if reported != size as u64 {
+            return Err(std::io::Error::other(format!(
+                "parallel download reported {reported} progress bytes, expected {size}"
+            ))
+            .into());
+        }
 
-    // Clean up
+        Ok(())
+    }
+    .await;
+
     let _ = tokio::fs::remove_file(&temp_path).await;
+    let _ = mega.delete_node(node).await;
+    let _ = mega.logout().await;
 
-    mega.delete_node(node)
-        .await
-        .expect("could not delete test file");
-
-    mega.logout().await.expect("could not log out from MEGA");
+    test_result.expect("parallel upload/download assertions failed");
 }

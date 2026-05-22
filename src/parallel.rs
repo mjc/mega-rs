@@ -259,10 +259,11 @@ fn write_all_at_blocking(file: &StdFile, mut offset: u64, mut data: &[u8]) -> io
 }
 
 fn reserve_plaintext_buffer(buffer: &mut Vec<u8>, target_size: usize) {
-    buffer.clear();
-    if buffer.capacity() < target_size {
-        buffer.reserve_exact(target_size - buffer.capacity());
+    let needed = target_size.saturating_sub(buffer.capacity());
+    if needed > 0 {
+        buffer.reserve_exact(needed);
     }
+    buffer.clear();
 }
 
 // ============================================================================
@@ -417,6 +418,7 @@ where
     }
 
     writer.flush().await?;
+    writer.sync_data().await?;
 
     Ok(())
 }
@@ -479,9 +481,17 @@ async fn stream_download_worker_to_file(
             plaintext.extend_from_slice(&bytes);
             decrypt(&ctx.aes_key, &ctx.aes_iv, file_offset, &mut plaintext);
             chunk_mac.update(&plaintext);
-            tokio::task::block_in_place(|| {
-                write_all_at_blocking(&ctx.std_file, file_offset, &plaintext)
-            })?;
+            plaintext = tokio::task::spawn_blocking({
+                let std_file = Arc::clone(&ctx.std_file);
+                let write_offset = file_offset;
+                let plaintext = std::mem::take(&mut plaintext);
+                move || -> std::io::Result<Vec<u8>> {
+                    write_all_at_blocking(&std_file, write_offset, &plaintext)?;
+                    Ok(plaintext)
+                }
+            })
+            .await
+            .map_err(|e| std::io::Error::other(format!("positioned write task failed: {e}")))??;
 
             file_offset += read_len as u64;
             remaining -= read_len;
@@ -840,6 +850,7 @@ pub(crate) async fn download_parallel_resumable_to_file_with_callbacks(
             compute_condensed_mac(Cursor::new(Vec::new()), 0, &aes_key, &aes_iv_8).await?;
 
         return if empty_mac == expected_mac {
+            writer.sync_data().await?;
             Ok(())
         } else {
             Err(Error::CondensedMacMismatch)
@@ -895,6 +906,7 @@ pub(crate) async fn download_parallel_resumable_to_file_with_callbacks(
     if untrusted_chunks == 0 {
         let computed_mac = mac.finalize().ok_or(Error::CondensedMacMismatch)?;
         return if computed_mac == expected_mac {
+            writer.sync_data().await?;
             Ok(())
         } else {
             Err(Error::CondensedMacMismatch)
@@ -938,6 +950,7 @@ pub(crate) async fn download_parallel_resumable_to_file_with_callbacks(
 
     let computed_mac = mac.finalize().ok_or(Error::CondensedMacMismatch)?;
     if computed_mac == expected_mac {
+        std_file.sync_data()?;
         Ok(())
     } else {
         Err(Error::CondensedMacMismatch)
@@ -1663,10 +1676,12 @@ mod tests {
             iv,
             iv8,
             Arc::new(ChunkBufferPool::default()),
-            Some(Arc::new(move |_index, _mac| {
-                callback_events_for_cb.lock().unwrap().push("callback");
-            })),
-            None,
+            callbacks_from_parts(
+                None,
+                Some(Arc::new(move |_index, _mac| {
+                    callback_events_for_cb.lock().unwrap().push("callback");
+                })),
+            ),
             None,
             None,
         )
@@ -1674,9 +1689,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(writer.bytes(), plaintext);
-        assert_eq!(writer.sync_calls(), 0);
+        assert_eq!(writer.sync_calls(), 1);
         let writer_journal = writer.journal();
-        assert_eq!(writer_journal.as_slice(), &["flush", "flush"]);
+        assert_eq!(writer_journal.as_slice(), &["flush", "flush", "sync"]);
         assert_eq!(callback_events.lock().unwrap().as_slice(), &["callback"]);
     }
 
@@ -1708,7 +1723,7 @@ mod tests {
         .unwrap();
         drop(tx);
 
-        process_chunks(
+        let err = process_chunks(
             rx,
             writer.clone(),
             mac,
@@ -1716,18 +1731,21 @@ mod tests {
             iv,
             iv8,
             Arc::new(ChunkBufferPool::default()),
-            Some(Arc::new(move |_index, _mac| {
-                *callback_count_for_cb.lock().unwrap() += 1;
-            })),
-            None,
+            callbacks_from_parts(
+                None,
+                Some(Arc::new(move |_index, _mac| {
+                    *callback_count_for_cb.lock().unwrap() += 1;
+                })),
+            ),
             None,
             None,
         )
         .await
-        .unwrap();
+        .unwrap_err();
 
         assert_eq!(writer.bytes(), plaintext);
         assert_eq!(*callback_count.lock().unwrap(), 1);
+        assert!(matches!(err, Error::IoError { .. }));
     }
 
     #[tokio::test(flavor = "multi_thread")]

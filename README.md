@@ -80,7 +80,7 @@ TLS backend selection
   cargo build --no-default-features --features "native-tls"
   ```
 
-  This also means `reqwest` (and any other feature that depends on it, like `parallel`) must be opted into explicitly.
+  With `--no-default-features`, enable any additional crate features you need explicitly. For example, use `--features "native-tls,parallel"` to build with native TLS and parallel downloads. `reqwest` remains a transitive dependency of the TLS backend features.
 
 License
 -------

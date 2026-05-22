@@ -15,7 +15,11 @@ impl RsaPrivateKey {
         let (p, data) = get_mpi(data)?;
         let (q, data) = get_mpi(data)?;
         let (d, data) = get_mpi(data)?;
-        let (u, _) = get_mpi(data)?;
+        let (u, data) = get_mpi(data)?;
+        if data.len() >= 16 {
+            return Err(Error::InvalidRsaPrivateKeyFormat);
+        }
+
         Ok(Self {
             p: rsa::BigUint::from_bytes_be(p),
             q: rsa::BigUint::from_bytes_be(q),
@@ -74,5 +78,57 @@ mod tests {
         let direct = ciphertext.modpow(&d, &(&p * &q));
 
         assert_eq!(decrypt_rsa(&ciphertext, &p, &q, &d, &u), direct);
+    }
+
+    fn mpi_bytes(value: &[u8]) -> Vec<u8> {
+        let bit_len = (value.len() * 8) as u16;
+        let mut bytes = bit_len.to_be_bytes().to_vec();
+        bytes.extend_from_slice(value);
+        bytes
+    }
+
+    #[test]
+    fn private_key_allows_zero_padding_after_mpis() {
+        let mut bytes = Vec::new();
+        bytes.extend(mpi_bytes(&[61]));
+        bytes.extend(mpi_bytes(&[53]));
+        bytes.extend(mpi_bytes(&[0x0a, 0xc1]));
+        bytes.extend(mpi_bytes(&[20]));
+        bytes.extend([0, 0, 0]);
+
+        let key = RsaPrivateKey::from_mpi_bytes(&bytes).unwrap();
+
+        assert_eq!(key.p, rsa::BigUint::from(61u8));
+        assert_eq!(key.q, rsa::BigUint::from(53u8));
+        assert_eq!(key.d, rsa::BigUint::from(2753u16));
+        assert_eq!(key.u, rsa::BigUint::from(20u8));
+    }
+
+    #[test]
+    fn private_key_allows_partial_block_padding_after_mpis() {
+        let mut bytes = Vec::new();
+        bytes.extend(mpi_bytes(&[61]));
+        bytes.extend(mpi_bytes(&[53]));
+        bytes.extend(mpi_bytes(&[0x0a, 0xc1]));
+        bytes.extend(mpi_bytes(&[20]));
+        bytes.extend([0, 1]);
+
+        let key = RsaPrivateKey::from_mpi_bytes(&bytes).unwrap();
+
+        assert_eq!(key.u, rsa::BigUint::from(20u8));
+    }
+
+    #[test]
+    fn private_key_rejects_extra_trailing_block() {
+        let mut bytes = Vec::new();
+        bytes.extend(mpi_bytes(&[61]));
+        bytes.extend(mpi_bytes(&[53]));
+        bytes.extend(mpi_bytes(&[0x0a, 0xc1]));
+        bytes.extend(mpi_bytes(&[20]));
+        bytes.extend([0xff; 16]);
+
+        let err = RsaPrivateKey::from_mpi_bytes(&bytes).unwrap_err();
+
+        assert!(matches!(err, Error::InvalidRsaPrivateKeyFormat));
     }
 }
