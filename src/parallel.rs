@@ -1022,6 +1022,47 @@ mod tests {
     }
 
     #[test]
+    fn chunk_boundary_iterator_matches_allocated_boundaries() {
+        for size in [
+            0,
+            1,
+            128 * 1024,
+            128 * 1024 + 1,
+            1280 * 1024,
+            8 * 1024 * 1024 + 17,
+        ] {
+            let allocated = mega_chunk_boundaries(size);
+            let iterated: Vec<_> = crate::mega_chunk_boundaries_iter(size).collect();
+            assert_eq!(iterated, allocated);
+        }
+    }
+
+    #[test]
+    fn sequential_condensed_mac_matches_parallel_processor() {
+        let size = 1280 * 1024 + 13;
+        let key = [0x42; 16];
+        let iv = [0x13; 8];
+        let mut data = vec![0; size];
+        for (idx, byte) in data.iter_mut().enumerate() {
+            *byte = idx.wrapping_mul(31) as u8;
+        }
+
+        let processor = ParallelMacProcessor::new(size as u64, &key, &iv);
+        let mut condensed = crate::MegaCondensedMac::new(&key);
+        for boundary in crate::mega_chunk_boundaries_iter(size as u64) {
+            let start = usize::try_from(boundary.offset).unwrap();
+            let end = start + usize::try_from(boundary.length).unwrap();
+            let mut mac = MegaChunkMac::new(&key, &iv);
+            mac.update(&data[start..end]);
+            let chunk_mac = mac.finalize();
+            assert!(processor.set_chunk_mac(boundary.index as usize, chunk_mac));
+            condensed.update_chunk_mac(&chunk_mac);
+        }
+
+        assert_eq!(condensed.finalize(), processor.finalize().unwrap());
+    }
+
+    #[test]
     fn decrypt_roundtrip() {
         let key = [0x42u8; 16];
         let iv = [0x13u8; 16];

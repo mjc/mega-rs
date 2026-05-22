@@ -287,6 +287,53 @@ pub struct MegaChunk {
     pub length: u64,
 }
 
+/// Iterator over the plaintext MAC chunk boundaries MEGA uses for a file size.
+#[derive(Debug, Clone)]
+pub struct MegaChunkBoundaries {
+    file_size: u64,
+    offset: u64,
+    next_size: u64,
+    index: u32,
+}
+
+impl MegaChunkBoundaries {
+    #[must_use]
+    fn new(file_size: u64) -> Self {
+        Self {
+            file_size,
+            offset: 0,
+            next_size: 131_072,
+            index: 0,
+        }
+    }
+}
+
+impl Iterator for MegaChunkBoundaries {
+    type Item = MegaChunk;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.offset >= self.file_size {
+            return None;
+        }
+
+        let offset = self.offset;
+        let length = self.next_size.min(self.file_size - offset);
+        let index = self.index;
+
+        self.offset += length;
+        self.index += 1;
+        if self.next_size < 1_048_576 {
+            self.next_size += 131_072;
+        }
+
+        Some(MegaChunk {
+            index,
+            offset,
+            length,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ChunkInfo {
     start: u64,
@@ -314,15 +361,13 @@ fn build_chunk_boundaries(file_size: u64) -> Vec<ChunkInfo> {
 /// Returns the plaintext MAC chunk boundaries MEGA uses for a file size.
 #[must_use]
 pub fn mega_chunk_boundaries(file_size: u64) -> Vec<MegaChunk> {
-    build_chunk_boundaries(file_size)
-        .into_iter()
-        .enumerate()
-        .map(|(index, info)| MegaChunk {
-            index: index as u32,
-            offset: info.start,
-            length: info.size,
-        })
-        .collect()
+    mega_chunk_boundaries_iter(file_size).collect()
+}
+
+/// Streams the plaintext MAC chunk boundaries MEGA uses for a file size.
+#[must_use]
+pub fn mega_chunk_boundaries_iter(file_size: u64) -> MegaChunkBoundaries {
+    MegaChunkBoundaries::new(file_size)
 }
 
 /// A parallel MAC processor that computes MEGA chunk MACs independently.
@@ -519,6 +564,36 @@ pub struct MegaChunkMac {
     cur_mac: [u8; 16],
     partial: [u8; 16],
     partial_len: usize,
+}
+
+#[cfg(feature = "parallel")]
+pub struct MegaCondensedMac {
+    aes: Aes128,
+    final_mac_data: [u8; 16],
+}
+
+#[cfg(feature = "parallel")]
+impl MegaCondensedMac {
+    #[must_use]
+    pub fn new(aes_key: &[u8; 16]) -> Self {
+        Self {
+            aes: Aes128::new(aes_key.into()),
+            final_mac_data: [0; 16],
+        }
+    }
+
+    pub fn update_chunk_mac(&mut self, chunk_mac: &[u8; 16]) {
+        encrypt_cbc_block(&self.aes, &mut self.final_mac_data, chunk_mac);
+    }
+
+    #[must_use]
+    pub fn finalize(mut self) -> [u8; 8] {
+        for i in 0..4 {
+            self.final_mac_data[i] ^= self.final_mac_data[i + 4];
+            self.final_mac_data[i + 4] = self.final_mac_data[i + 8] ^ self.final_mac_data[i + 12];
+        }
+        self.final_mac_data[..8].try_into().unwrap()
+    }
 }
 
 #[cfg(feature = "parallel")]

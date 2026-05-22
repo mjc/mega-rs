@@ -34,7 +34,8 @@ pub use crate::fingerprint::{
 };
 #[cfg(feature = "parallel")]
 pub use crate::fingerprint::{
-    compute_mega_chunk_mac, mega_chunk_boundaries, MegaChunk, MegaChunkMac, ParallelMacProcessor,
+    compute_mega_chunk_mac, mega_chunk_boundaries, mega_chunk_boundaries_iter, MegaChunk,
+    MegaChunkBoundaries, MegaChunkMac, MegaCondensedMac, ParallelMacProcessor,
 };
 #[cfg(feature = "parallel")]
 pub use crate::parallel::{ParallelDownloadCallbacks, ParallelDownloadWriter};
