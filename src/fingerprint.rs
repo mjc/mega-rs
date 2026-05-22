@@ -334,28 +334,78 @@ impl Iterator for MegaChunkBoundaries {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ChunkInfo {
-    start: u64,
-    size: u64,
-}
+const MEGA_CHUNK_SIZE_STEP: u64 = 131_072;
+const MEGA_MAX_CHUNK_SIZE: u64 = 1_048_576;
+const MEGA_RAMP_CHUNKS: usize = 8;
+const MEGA_RAMP_BYTES: u64 = MEGA_CHUNK_SIZE_STEP * 36;
 
-fn build_chunk_boundaries(file_size: u64) -> Vec<ChunkInfo> {
-    let mut boundaries = Vec::new();
-    let mut offset = 0u64;
-    let mut size = 131_072u64;
-    while offset < file_size {
-        let actual_size = size.min(file_size - offset);
-        boundaries.push(ChunkInfo {
-            start: offset,
-            size: actual_size,
-        });
-        offset += actual_size;
-        if size < 1_048_576 {
-            size += 131_072;
+fn mega_chunk_count(file_size: u64) -> usize {
+    if file_size == 0 {
+        return 0;
+    }
+
+    if file_size <= MEGA_RAMP_BYTES {
+        let mut offset = 0;
+        for idx in 0..MEGA_RAMP_CHUNKS {
+            let size = MEGA_CHUNK_SIZE_STEP * (idx as u64 + 1);
+            offset += size;
+            if file_size <= offset {
+                return idx + 1;
+            }
         }
     }
-    boundaries
+
+    let remaining = file_size - MEGA_RAMP_BYTES;
+    MEGA_RAMP_CHUNKS + remaining.div_ceil(MEGA_MAX_CHUNK_SIZE) as usize
+}
+
+fn mega_chunk_by_index(file_size: u64, index: usize) -> Option<MegaChunk> {
+    if index >= mega_chunk_count(file_size) {
+        return None;
+    }
+
+    let (offset, max_length) = if index < MEGA_RAMP_CHUNKS {
+        let idx = index as u64;
+        (
+            MEGA_CHUNK_SIZE_STEP * idx * (idx + 1) / 2,
+            MEGA_CHUNK_SIZE_STEP * (idx + 1),
+        )
+    } else {
+        (
+            MEGA_RAMP_BYTES + (index - MEGA_RAMP_CHUNKS) as u64 * MEGA_MAX_CHUNK_SIZE,
+            MEGA_MAX_CHUNK_SIZE,
+        )
+    };
+
+    Some(MegaChunk {
+        index: index as u32,
+        offset,
+        length: max_length.min(file_size - offset),
+    })
+}
+
+fn mega_chunk_for_offset(file_size: u64, offset: u64) -> Option<(usize, MegaChunk)> {
+    if offset >= file_size {
+        return None;
+    }
+
+    let index = if offset < MEGA_RAMP_BYTES {
+        let mut chunk_start = 0;
+        let mut index = 0;
+        while index < MEGA_RAMP_CHUNKS {
+            let size = MEGA_CHUNK_SIZE_STEP * (index as u64 + 1);
+            if offset < chunk_start + size {
+                break;
+            }
+            chunk_start += size;
+            index += 1;
+        }
+        index
+    } else {
+        MEGA_RAMP_CHUNKS + ((offset - MEGA_RAMP_BYTES) / MEGA_MAX_CHUNK_SIZE) as usize
+    };
+
+    mega_chunk_by_index(file_size, index).map(|chunk| (index, chunk))
 }
 
 /// Returns the plaintext MAC chunk boundaries MEGA uses for a file size.
@@ -419,14 +469,12 @@ pub struct ParallelMacProcessor {
     aes_key: [u8; 16],
     aes_iv_full: [u8; 16],
     file_size: u64,
-
-    // Pre-computed chunk boundaries for O(1)/O(log n) lookups
-    chunk_boundaries: Box<[ChunkInfo]>,
+    num_chunks: usize,
 
     // Computed MACs per MEGA chunk: 16-byte MAC stored as two u64s with computed flag
     chunk_macs: Vec<MacEntry>,
 
-    // Partial chunk state: (data buffer, bytes received)
+    // Partial chunk state. Allocated only when a caller sends partial MEGA chunks.
     chunk_state: std::sync::Mutex<Vec<Option<ChunkState>>>,
 }
 
@@ -467,15 +515,12 @@ impl ParallelMacProcessor {
             iv
         };
 
-        // Pre-compute all chunk boundaries.
-        let chunk_boundaries = build_chunk_boundaries(file_size).into_boxed_slice();
-
-        let num_chunks = chunk_boundaries.len();
+        let num_chunks = mega_chunk_count(file_size);
         Self {
             aes_key: *aes_key,
             aes_iv_full,
             file_size,
-            chunk_boundaries,
+            num_chunks,
             chunk_macs: (0..num_chunks)
                 .map(|_| MacEntry {
                     lo: std::sync::atomic::AtomicU64::new(0),
@@ -483,33 +528,14 @@ impl ParallelMacProcessor {
                     computed: std::sync::atomic::AtomicBool::new(false),
                 })
                 .collect(),
-            chunk_state: std::sync::Mutex::new((0..num_chunks).map(|_| None).collect()),
+            chunk_state: std::sync::Mutex::new(Vec::new()),
         }
     }
 
     /// Returns (mega_chunk_index, offset_within_chunk) for a file offset
-    /// Uses binary search for O(log n) lookup
     fn mega_chunk_for_offset(&self, offset: u64) -> Option<(usize, u64)> {
-        // Out-of-bounds offsets are not valid and should not be processed
-        if offset >= self.file_size {
-            return None;
-        }
-
-        let idx = self
-            .chunk_boundaries
-            .binary_search_by(|info| {
-                if offset < info.start {
-                    std::cmp::Ordering::Greater
-                } else if offset >= info.start + info.size {
-                    std::cmp::Ordering::Less
-                } else {
-                    std::cmp::Ordering::Equal
-                }
-            })
-            .ok()?;
-
-        let chunk_start = self.chunk_boundaries[idx].start;
-        Some((idx, offset - chunk_start))
+        let (idx, chunk) = mega_chunk_for_offset(self.file_size, offset)?;
+        Some((idx, offset - chunk.offset))
     }
 
     fn lock_chunk_state(&self) -> std::sync::MutexGuard<'_, Vec<Option<ChunkState>>> {
@@ -711,8 +737,8 @@ impl ParallelMacProcessor {
     /// Add data at the given file offset. Can be called from multiple threads.
     ///
     /// Processes data linearly through MEGA chunks:
-    /// - One initial binary search to find the starting chunk
-    /// - Then linear iteration through successive chunks (no per-iteration searches)
+    /// - One initial boundary calculation to find the starting chunk
+    /// - Then linear iteration through successive chunks
     /// - Complete chunks compute MACs directly; partial chunks are buffered
     pub fn add_chunk(&self, offset: u64, data: &[u8]) -> Result<()> {
         let data_len = data.len();
@@ -739,16 +765,17 @@ impl ParallelMacProcessor {
         let mut pos = offset;
         let mut remaining = data;
 
-        while !remaining.is_empty() && chunk_idx < self.chunk_boundaries.len() {
-            let info = self.chunk_boundaries[chunk_idx];
-            let chunk_end = info.start + info.size;
-            let offset_in_chunk = (pos - info.start) as usize;
+        while !remaining.is_empty() && chunk_idx < self.num_chunks {
+            let info = mega_chunk_by_index(self.file_size, chunk_idx)
+                .ok_or_else(|| parallel_chunk_range_error(pos, end_offset, self.file_size))?;
+            let chunk_end = info.offset + info.length;
+            let offset_in_chunk = (pos - info.offset) as usize;
             let bytes_until_end = (chunk_end - pos) as usize;
             let to_take = remaining.len().min(bytes_until_end);
             let (for_this_chunk, rest) = remaining.split_at(to_take);
 
             // Fast path: complete, aligned chunk - compute MAC directly
-            if offset_in_chunk == 0 && to_take == info.size as usize {
+            if offset_in_chunk == 0 && to_take == info.length as usize {
                 if !self.chunk_macs[chunk_idx].is_computed() {
                     let mac =
                         compute_chunk_mac_inner(&self.aes_key, &self.aes_iv_full, for_this_chunk);
@@ -760,11 +787,14 @@ impl ParallelMacProcessor {
                     chunk_idx,
                     offset_in_chunk,
                     for_this_chunk,
-                    info.size as usize,
+                    info.length as usize,
                 )? {
                     let mac = compute_chunk_mac_inner(&self.aes_key, &self.aes_iv_full, &data);
                     self.chunk_macs[chunk_idx].store(mac);
-                    self.lock_chunk_state()[chunk_idx] = None;
+                    let mut states = self.lock_chunk_state();
+                    if chunk_idx < states.len() {
+                        states[chunk_idx] = None;
+                    }
                 }
             }
 
@@ -800,6 +830,9 @@ impl ParallelMacProcessor {
 
         {
             let mut states = self.lock_chunk_state();
+            if chunk_idx >= states.len() {
+                states.resize_with(chunk_idx + 1, || None);
+            }
 
             if self.chunk_macs[chunk_idx].is_computed() {
                 states[chunk_idx] = None;
@@ -854,11 +887,10 @@ impl ParallelMacProcessor {
 
     /// Finalize and return the combined MAC
     pub fn finalize(&self) -> Option<[u8; 8]> {
-        let num_chunks = self.chunk_boundaries.len();
         let aes = Aes128::new((&self.aes_key).into());
 
         // Verify we have all chunks
-        for idx in 0..num_chunks {
+        for idx in 0..self.num_chunks {
             if !self.chunk_macs[idx].is_computed() {
                 return None;
             }
@@ -867,7 +899,7 @@ impl ParallelMacProcessor {
         // Combine MACs in order
         let mut final_mac_data = [0u8; 16];
 
-        for idx in 0..num_chunks {
+        for idx in 0..self.num_chunks {
             let cur_mac = self.chunk_macs[idx].load()?;
             encrypt_cbc_block(&aes, &mut final_mac_data, &cur_mac);
         }
@@ -1118,6 +1150,97 @@ mod tests {
 
             assert_eq!(checksum1, checksum2);
         });
+    }
+
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn mega_chunk_count_matches_boundary_iterator() {
+        for size in [
+            0,
+            1,
+            MEGA_CHUNK_SIZE_STEP,
+            MEGA_CHUNK_SIZE_STEP + 1,
+            MEGA_RAMP_BYTES - 1,
+            MEGA_RAMP_BYTES,
+            MEGA_RAMP_BYTES + 1,
+            MEGA_RAMP_BYTES + MEGA_MAX_CHUNK_SIZE,
+            MEGA_RAMP_BYTES + MEGA_MAX_CHUNK_SIZE + 1,
+            64 * 1024 * 1024 + 17,
+        ] {
+            assert_eq!(
+                mega_chunk_count(size),
+                mega_chunk_boundaries_iter(size).count(),
+                "size {size}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn mega_chunk_offset_lookup_matches_boundary_iterator() {
+        for size in [
+            1,
+            MEGA_CHUNK_SIZE_STEP,
+            MEGA_RAMP_BYTES - 1,
+            MEGA_RAMP_BYTES,
+            MEGA_RAMP_BYTES + 2 * MEGA_MAX_CHUNK_SIZE + 17,
+        ] {
+            for expected in mega_chunk_boundaries_iter(size) {
+                for offset in [expected.offset, expected.offset + expected.length - 1] {
+                    let (index, found) = mega_chunk_for_offset(size, offset).unwrap();
+                    assert_eq!(index, expected.index as usize);
+                    assert_eq!(found, expected);
+                }
+            }
+            assert!(mega_chunk_for_offset(size, size).is_none());
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn parallel_mac_processor_starts_without_partial_state() {
+        let processor = ParallelMacProcessor::new(10 * 1024 * 1024, &TEST_KEY, &TEST_IV);
+
+        assert_eq!(processor.num_chunks, mega_chunk_count(10 * 1024 * 1024));
+        assert!(processor.lock_chunk_state().is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn parallel_mac_processor_full_chunks_do_not_allocate_partial_state() -> Result<()> {
+        let size = MEGA_RAMP_BYTES + MEGA_MAX_CHUNK_SIZE;
+        let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        let processor = ParallelMacProcessor::new(size, &TEST_KEY, &TEST_IV);
+
+        for chunk in mega_chunk_boundaries_iter(size) {
+            let start = chunk.offset as usize;
+            let end = start + chunk.length as usize;
+            processor.add_chunk(chunk.offset, &data[start..end])?;
+        }
+
+        assert!(processor.lock_chunk_state().is_empty());
+        assert!(processor.finalize().is_some());
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn parallel_mac_processor_allocates_partial_state_only_for_split_chunks() -> Result<()> {
+        let size = MEGA_RAMP_BYTES + 17;
+        let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        let processor = ParallelMacProcessor::new(size, &TEST_KEY, &TEST_IV);
+        let first = mega_chunk_boundaries_iter(size).next().unwrap();
+        let split = first.length as usize / 2;
+
+        processor.add_chunk(first.offset, &data[..split])?;
+        assert!(!processor.lock_chunk_state().is_empty());
+
+        processor.add_chunk(
+            first.offset + split as u64,
+            &data[split..first.length as usize],
+        )?;
+        assert!(processor.lock_chunk_state()[first.index as usize].is_none());
+        Ok(())
     }
 
     #[test]
