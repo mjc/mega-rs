@@ -5,6 +5,7 @@
 //! - Processor (single): decrypt, write, update MAC
 //! - Uses ParallelMacProcessor for out-of-order MAC computation
 
+use std::fmt::Write as _;
 use std::fs::File as StdFile;
 use std::io;
 use std::io::SeekFrom;
@@ -201,12 +202,11 @@ impl MegaChunk {
         self.offset + self.length
     }
 
-    fn url(&self, base_url: &str) -> String {
-        format!(
-            "{base_url}/{}-{}",
-            self.offset,
-            self.end().saturating_sub(1)
-        )
+    fn write_url(&self, base_url: &str, output: &mut String) {
+        output.clear();
+        output.push_str(base_url);
+        output.push('/');
+        let _ = write!(output, "{}-{}", self.offset, self.end().saturating_sub(1));
     }
 }
 
@@ -270,7 +270,7 @@ fn reserve_plaintext_buffer(buffer: &mut Vec<u8>, target_size: usize) {
 // ============================================================================
 
 struct DownloadContext {
-    base_url: String,
+    base_url: Arc<str>,
     next_chunk: Arc<AtomicU64>,
     chunks: Arc<[MegaChunk]>,
     trusted_chunks: Arc<[Option<[u8; 16]>]>,
@@ -279,6 +279,7 @@ struct DownloadContext {
 }
 
 async fn download_worker(client: &dyn HttpClient, ctx: DownloadContext) -> Result<()> {
+    let mut url_buffer = String::with_capacity(ctx.base_url.len() + 48);
     loop {
         let idx = ctx.next_chunk.fetch_add(1, Ordering::Relaxed);
         let Some(range) = ctx.chunks.get(idx as usize).copied() else {
@@ -303,7 +304,8 @@ async fn download_worker(client: &dyn HttpClient, ctx: DownloadContext) -> Resul
             buffer.truncate(target_size);
         }
 
-        let url = range.url(&ctx.base_url).parse()?;
+        range.write_url(&ctx.base_url, &mut url_buffer);
+        let url = url_buffer.parse()?;
         let mut response = client.get(url).await?;
         let mut bytes_read = 0;
 
@@ -421,7 +423,7 @@ where
 }
 
 struct StreamingFileDownloadContext {
-    base_url: String,
+    base_url: Arc<str>,
     next_chunk: Arc<AtomicU64>,
     chunks: Arc<[MegaChunk]>,
     trusted_chunks: Arc<[Option<[u8; 16]>]>,
@@ -439,6 +441,7 @@ async fn stream_download_worker_to_file(
     client: &dyn HttpClient,
     ctx: StreamingFileDownloadContext,
 ) -> Result<()> {
+    let mut url_buffer = String::with_capacity(ctx.base_url.len() + 48);
     let max_chunk_len = ctx
         .chunks
         .iter()
@@ -460,7 +463,8 @@ async fn stream_download_worker_to_file(
             continue;
         }
 
-        let url = range.url(&ctx.base_url).parse()?;
+        range.write_url(&ctx.base_url, &mut url_buffer);
+        let url = url_buffer.parse()?;
         let mut response = client.get(url).await?;
         let mut remaining = range.length as usize;
         let mut file_offset = range.offset;
@@ -702,6 +706,7 @@ where
     // Cap workers so we never exceed the number of chunks or the configured maximum
     let num_workers = requested_workers.min(untrusted_chunks);
     let next_chunk = Arc::new(AtomicU64::new(0));
+    let base_url: Arc<str> = base_url.into();
 
     // Channel: downloaders → processor
     // Bounded to num_workers so each worker can have at most one queued chunk while
@@ -743,7 +748,7 @@ where
     let download_workers: Vec<_> = (0..num_workers)
         .map(|_| {
             let ctx = DownloadContext {
-                base_url: base_url.clone(),
+                base_url: Arc::clone(&base_url),
                 next_chunk: Arc::clone(&next_chunk),
                 chunks: Arc::clone(&chunks),
                 trusted_chunks: Arc::clone(&trusted_chunks),
@@ -909,6 +914,7 @@ pub(crate) async fn download_parallel_resumable_to_file_with_callbacks(
 
     let num_workers = requested_workers.min(untrusted_chunks);
     let next_chunk = Arc::new(AtomicU64::new(0));
+    let base_url: Arc<str> = base_url.into();
     let progress_total = callbacks
         .as_ref()
         .filter(|cb| cb.tracks_progress())
@@ -922,7 +928,7 @@ pub(crate) async fn download_parallel_resumable_to_file_with_callbacks(
     let mut workers = Vec::with_capacity(num_workers);
     for _ in 0..num_workers {
         let ctx = StreamingFileDownloadContext {
-            base_url: base_url.clone(),
+            base_url: Arc::clone(&base_url),
             next_chunk: Arc::clone(&next_chunk),
             chunks: Arc::clone(&chunks),
             trusted_chunks: Arc::clone(&trusted_chunks),
