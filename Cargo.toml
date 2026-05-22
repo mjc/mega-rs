@@ -63,7 +63,7 @@ default = ["reqwest", "rustls-tls"]
 reqwest = ["dep:reqwest", "dep:tokio", "dep:tokio-util"]
 parallel = ["reqwest"]
 native-tls = ["reqwest", "reqwest/default-tls"]
-rustls-tls = ["reqwest/rustls-tls"]
+rustls-tls = ["reqwest", "reqwest/rustls-tls"]
 
 [dev-dependencies]
 async-read-progress = "0.2.0"
