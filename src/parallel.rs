@@ -105,16 +105,6 @@ impl ParallelDownloadWriter for tokio::fs::File {
     async fn sync_data(&mut self) -> std::io::Result<()> {
         tokio::fs::File::sync_data(self).await
     }
-
-    async fn write_chunk(&mut self, offset: u64, data: Vec<u8>) -> std::io::Result<Vec<u8>> {
-        let std_file = self.try_clone().await?.into_std().await;
-        tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
-            write_all_at_blocking(&std_file, offset, &data)?;
-            Ok(data)
-        })
-        .await
-        .map_err(|e| std::io::Error::other(format!("positioned write task failed: {e}")))?
-    }
 }
 
 struct NoSyncWriter<W>(W);
