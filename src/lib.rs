@@ -60,6 +60,10 @@ async fn collect_http_body(mut body: crate::http::HttpGetStream) -> Result<Vec<u
     Ok(buffer)
 }
 
+async fn sleep_retry_delay(delay: Duration) {
+    futures_timer::Delay::new(delay).await;
+}
+
 /// A builder to initialize a [`Client`] instance.
 pub struct ClientBuilder {
     /// The API's origin.
@@ -2098,7 +2102,7 @@ impl Client {
         let mut delay = self.state.min_retry_delay;
         for i in 0..self.state.max_retries {
             if i > 0 {
-                tokio::time::sleep(delay).await;
+                sleep_retry_delay(delay).await;
                 delay *= 2;
                 // TODO: maybe add some small random jitter after the doubling.
                 if delay > self.state.max_retry_delay {

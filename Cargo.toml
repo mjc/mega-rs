@@ -20,6 +20,7 @@ base64 = "0.22.1"
 # Async helpers
 async-trait = "0.1.83"
 futures = "0.3.31"
+futures-timer = "3.0.3"
 sluice = "0.5.5"
 
 # Error handling
@@ -50,7 +51,7 @@ hmac = "0.12.1"
 
 # `reqwest` support (TLS backend selected via this crate's `native-tls`/`rustls-tls` features)
 reqwest = { version = "0.12.8", default-features = false, features = ["json", "stream"], optional = true }
-tokio = { version = "1.40.0", features = ["time", "rt-multi-thread"] }
+tokio = { version = "1.40.0", features = ["time", "rt-multi-thread"], optional = true }
 tokio-util = { version = "0.7.12", features = ["compat", "codec"], optional = true }
 bytes = "1"
 
@@ -60,7 +61,7 @@ secrecy = { version = "0.10.2", features = ["serde"] }
 
 [features]
 default = ["reqwest", "rustls-tls"]
-reqwest = ["dep:reqwest", "dep:tokio-util"]
+reqwest = ["dep:reqwest", "dep:tokio", "dep:tokio-util"]
 parallel = ["reqwest"]
 native-tls = ["reqwest", "reqwest/default-tls"]
 rustls-tls = ["reqwest", "reqwest/rustls-tls"]
