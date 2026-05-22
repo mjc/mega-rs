@@ -34,10 +34,10 @@ pub use crate::fingerprint::{
 };
 #[cfg(feature = "parallel")]
 pub use crate::fingerprint::{
-    compute_mega_chunk_mac, mega_chunk_boundaries, MegaChunk, ParallelMacProcessor,
+    compute_mega_chunk_mac, mega_chunk_boundaries, MegaChunk, MegaChunkMac, ParallelMacProcessor,
 };
 #[cfg(feature = "parallel")]
-pub use crate::parallel::ParallelDownloadWriter;
+pub use crate::parallel::{ParallelDownloadCallbacks, ParallelDownloadWriter};
 pub use crate::protocol::commands::{FileNode, NodeKind};
 pub use crate::sessions::SessionInfo;
 pub use crate::utils::StorageQuotas;
@@ -1416,6 +1416,41 @@ impl Client {
     }
 
     #[cfg(feature = "parallel")]
+    pub async fn download_node_parallel_resumable_with_callbacks<W>(
+        &self,
+        node: &Node,
+        writer: W,
+        num_connections: usize,
+        trusted_chunks: Arc<[Option<[u8; 16]>]>,
+        callbacks: Option<Arc<dyn ParallelDownloadCallbacks>>,
+    ) -> Result<()>
+    where
+        W: ParallelDownloadWriter + 'static,
+    {
+        if !node.kind.is_file() {
+            return Err(Error::NotAFileNode);
+        }
+
+        let aes_iv = node.aes_iv.ok_or(Error::MissingNodeAesIv)?;
+        let expected_mac = node.condensed_mac.ok_or(Error::MissingCondensedMac)?;
+
+        let (base_url, server_size) = self.get_download_url(node).await?;
+        parallel::download_parallel_resumable_with_callbacks(
+            &*self.client,
+            node,
+            base_url,
+            server_size,
+            writer,
+            num_connections,
+            Some(trusted_chunks),
+            callbacks,
+            aes_iv,
+            expected_mac,
+        )
+        .await
+    }
+
+    #[cfg(feature = "parallel")]
     pub async fn download_node_parallel_resumable_to_file_with_progress<F, C>(
         &self,
         node: &Node,
@@ -1451,6 +1486,38 @@ impl Client {
             progress,
             Some(trusted_chunks),
             chunk_verified,
+            aes_iv,
+            expected_mac,
+        )
+        .await
+    }
+
+    #[cfg(feature = "parallel")]
+    pub async fn download_node_parallel_resumable_to_file_with_callbacks(
+        &self,
+        node: &Node,
+        writer: tokio::fs::File,
+        num_connections: usize,
+        trusted_chunks: Arc<[Option<[u8; 16]>]>,
+        callbacks: Option<Arc<dyn ParallelDownloadCallbacks>>,
+    ) -> Result<()> {
+        if !node.kind.is_file() {
+            return Err(Error::NotAFileNode);
+        }
+
+        let aes_iv = node.aes_iv.ok_or(Error::MissingNodeAesIv)?;
+        let expected_mac = node.condensed_mac.ok_or(Error::MissingCondensedMac)?;
+
+        let (base_url, server_size) = self.get_download_url(node).await?;
+        parallel::download_parallel_resumable_to_file_with_callbacks(
+            &*self.client,
+            node,
+            base_url,
+            server_size,
+            writer,
+            num_connections,
+            Some(trusted_chunks),
+            callbacks,
             aes_iv,
             expected_mac,
         )

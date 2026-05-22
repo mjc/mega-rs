@@ -43,6 +43,53 @@ pub trait ParallelDownloadWriter: AsyncWrite + AsyncSeek + Unpin + Send {
     }
 }
 
+pub trait ParallelDownloadCallbacks: Send + Sync {
+    fn progress(&self, _cumulative_bytes: u64) {}
+
+    fn chunk_verified(&self, _index: u32, _mac: [u8; 16]) {}
+
+    fn tracks_progress(&self) -> bool {
+        true
+    }
+}
+
+struct FnDownloadCallbacks {
+    progress: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+    chunk_verified: Option<Arc<dyn Fn(u32, [u8; 16]) + Send + Sync>>,
+}
+
+impl ParallelDownloadCallbacks for FnDownloadCallbacks {
+    fn progress(&self, cumulative_bytes: u64) {
+        if let Some(ref cb) = self.progress {
+            cb(cumulative_bytes);
+        }
+    }
+
+    fn chunk_verified(&self, index: u32, mac: [u8; 16]) {
+        if let Some(ref cb) = self.chunk_verified {
+            cb(index, mac);
+        }
+    }
+
+    fn tracks_progress(&self) -> bool {
+        self.progress.is_some()
+    }
+}
+
+fn callbacks_from_parts(
+    progress: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+    chunk_verified: Option<Arc<dyn Fn(u32, [u8; 16]) + Send + Sync>>,
+) -> Option<Arc<dyn ParallelDownloadCallbacks>> {
+    if progress.is_some() || chunk_verified.is_some() {
+        Some(Arc::new(FnDownloadCallbacks {
+            progress,
+            chunk_verified,
+        }))
+    } else {
+        None
+    }
+}
+
 #[cfg(feature = "reqwest")]
 #[async_trait]
 impl ParallelDownloadWriter for tokio::fs::File {
@@ -316,8 +363,7 @@ async fn process_chunks<W>(
     aes_iv: [u8; 16],
     aes_iv_8: [u8; 8],
     buffer_pool: Arc<ChunkBufferPool>,
-    chunk_verified: Option<Arc<dyn Fn(u32, [u8; 16]) + Send + Sync>>,
-    progress: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+    callbacks: Option<Arc<dyn ParallelDownloadCallbacks>>,
     progress_total: Option<Arc<AtomicU64>>,
     progress_reported: Option<Arc<AtomicU64>>,
 ) -> Result<()>
@@ -351,8 +397,8 @@ where
         // File-backed writers can bypass Tokio's buffered async file adapter here.
         data = writer.write_chunk(offset, data).await?;
         writer.flush().await?;
-        if let Some(ref cb) = chunk_verified {
-            cb(chunk_index, chunk_mac);
+        if let Some(ref cb) = callbacks {
+            cb.chunk_verified(chunk_index, chunk_mac);
         }
         if let Some(ref total) = progress_total {
             let new_total =
@@ -360,8 +406,8 @@ where
             if let Some(ref reported) = progress_reported {
                 let prev = reported.fetch_max(new_total, Ordering::Relaxed);
                 if new_total > prev {
-                    if let Some(ref cb) = progress {
-                        cb(new_total);
+                    if let Some(ref cb) = callbacks {
+                        cb.progress(new_total);
                     }
                 }
             }
@@ -380,14 +426,13 @@ struct StreamingFileDownloadContext {
     chunks: Arc<[MegaChunk]>,
     trusted_chunks: Arc<[Option<[u8; 16]>]>,
     std_file: Arc<StdFile>,
-    progress: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+    callbacks: Option<Arc<dyn ParallelDownloadCallbacks>>,
     progress_total: Option<Arc<AtomicU64>>,
     progress_reported: Option<Arc<AtomicU64>>,
     mac: Arc<ParallelMacProcessor>,
     aes_key: [u8; 16],
     aes_iv: [u8; 16],
     aes_iv_8: [u8; 8],
-    chunk_verified: Option<Arc<dyn Fn(u32, [u8; 16]) + Send + Sync>>,
 }
 
 async fn stream_download_worker_to_file(
@@ -468,16 +513,16 @@ async fn stream_download_worker_to_file(
             write_all_at_blocking(&ctx.std_file, range.offset, &plaintext)
         })?;
 
-        if let Some(ref cb) = ctx.chunk_verified {
-            cb(chunk_index, chunk_mac);
+        if let Some(ref cb) = ctx.callbacks {
+            cb.chunk_verified(chunk_index, chunk_mac);
         }
         if let Some(ref total) = ctx.progress_total {
             let new_total = total.fetch_add(range.length, Ordering::Relaxed) + range.length;
             if let Some(ref reported) = ctx.progress_reported {
                 let prev = reported.fetch_max(new_total, Ordering::Relaxed);
                 if new_total > prev {
-                    if let Some(ref cb) = ctx.progress {
-                        cb(new_total);
+                    if let Some(ref cb) = ctx.callbacks {
+                        cb.progress(new_total);
                     }
                 }
             }
@@ -541,6 +586,37 @@ pub(crate) async fn download_parallel_resumable<W>(
 where
     W: ParallelDownloadWriter + 'static,
 {
+    let callbacks = callbacks_from_parts(progress_callback, chunk_verified);
+    download_parallel_resumable_with_callbacks(
+        client,
+        node,
+        base_url,
+        server_size,
+        writer,
+        num_connections,
+        trusted_chunks,
+        callbacks,
+        aes_iv,
+        expected_mac,
+    )
+    .await
+}
+
+pub(crate) async fn download_parallel_resumable_with_callbacks<W>(
+    client: &dyn HttpClient,
+    node: &Node,
+    base_url: String,
+    server_size: u64,
+    writer: W,
+    num_connections: usize,
+    trusted_chunks: Option<Arc<[Option<[u8; 16]>]>>,
+    callbacks: Option<Arc<dyn ParallelDownloadCallbacks>>,
+    aes_iv: [u8; 8],
+    expected_mac: [u8; 8],
+) -> Result<()>
+where
+    W: ParallelDownloadWriter + 'static,
+{
     if !node.kind.is_file() {
         return Err(Error::NotAFileNode);
     }
@@ -550,8 +626,10 @@ where
     let aes_iv_8 = aes_iv;
 
     if file_size == 0 {
-        if let Some(cb) = progress_callback {
-            cb(0);
+        if let Some(ref cb) = callbacks {
+            if cb.tracks_progress() {
+                cb.progress(0);
+            }
         }
 
         let empty_mac =
@@ -605,10 +683,11 @@ where
         }
     }
 
-    let progress: Option<Arc<dyn Fn(u64) + Send + Sync>> = progress_callback;
     if trusted_bytes > 0 {
-        if let Some(ref cb) = progress {
-            cb(trusted_bytes);
+        if let Some(ref cb) = callbacks {
+            if cb.tracks_progress() {
+                cb.progress(trusted_bytes);
+            }
         }
     }
     if untrusted_chunks == 0 {
@@ -631,11 +710,13 @@ where
     let (tx, rx) = mpsc::channel::<DownloadedChunk>(num_workers);
 
     // Progress callback with cumulative tracking and monotonic reporting
-    let progress_total = progress
+    let progress_total = callbacks
         .as_ref()
+        .filter(|cb| cb.tracks_progress())
         .map(|_| Arc::new(AtomicU64::new(trusted_bytes)));
-    let progress_reported = progress
+    let progress_reported = callbacks
         .as_ref()
+        .filter(|cb| cb.tracks_progress())
         .map(|_| Arc::new(AtomicU64::new(trusted_bytes)));
     let buffer_pool = Arc::new(ChunkBufferPool::default());
 
@@ -651,8 +732,7 @@ where
             aes_iv_16,
             aes_iv_8,
             processor_pool,
-            chunk_verified,
-            progress.clone(),
+            callbacks.clone(),
             progress_total.clone(),
             progress_reported.clone(),
         )
@@ -719,6 +799,34 @@ pub(crate) async fn download_parallel_resumable_to_file(
     aes_iv: [u8; 8],
     expected_mac: [u8; 8],
 ) -> Result<()> {
+    let callbacks = callbacks_from_parts(progress_callback, chunk_verified);
+    download_parallel_resumable_to_file_with_callbacks(
+        client,
+        node,
+        base_url,
+        server_size,
+        writer,
+        num_connections,
+        trusted_chunks,
+        callbacks,
+        aes_iv,
+        expected_mac,
+    )
+    .await
+}
+
+pub(crate) async fn download_parallel_resumable_to_file_with_callbacks(
+    client: &dyn HttpClient,
+    node: &Node,
+    base_url: String,
+    server_size: u64,
+    writer: tokio::fs::File,
+    num_connections: usize,
+    trusted_chunks: Option<Arc<[Option<[u8; 16]>]>>,
+    callbacks: Option<Arc<dyn ParallelDownloadCallbacks>>,
+    aes_iv: [u8; 8],
+    expected_mac: [u8; 8],
+) -> Result<()> {
     if !node.kind.is_file() {
         return Err(Error::NotAFileNode);
     }
@@ -728,8 +836,10 @@ pub(crate) async fn download_parallel_resumable_to_file(
     let aes_iv_8 = aes_iv;
 
     if file_size == 0 {
-        if let Some(cb) = progress_callback {
-            cb(0);
+        if let Some(ref cb) = callbacks {
+            if cb.tracks_progress() {
+                cb.progress(0);
+            }
         }
 
         let empty_mac =
@@ -781,10 +891,11 @@ pub(crate) async fn download_parallel_resumable_to_file(
         }
     }
 
-    let progress: Option<Arc<dyn Fn(u64) + Send + Sync>> = progress_callback;
     if trusted_bytes > 0 {
-        if let Some(ref cb) = progress {
-            cb(trusted_bytes);
+        if let Some(ref cb) = callbacks {
+            if cb.tracks_progress() {
+                cb.progress(trusted_bytes);
+            }
         }
     }
     if untrusted_chunks == 0 {
@@ -798,11 +909,13 @@ pub(crate) async fn download_parallel_resumable_to_file(
 
     let num_workers = requested_workers.min(untrusted_chunks);
     let next_chunk = Arc::new(AtomicU64::new(0));
-    let progress_total = progress
+    let progress_total = callbacks
         .as_ref()
+        .filter(|cb| cb.tracks_progress())
         .map(|_| Arc::new(AtomicU64::new(trusted_bytes)));
-    let progress_reported = progress
+    let progress_reported = callbacks
         .as_ref()
+        .filter(|cb| cb.tracks_progress())
         .map(|_| Arc::new(AtomicU64::new(trusted_bytes)));
     let std_file = Arc::new(writer.into_std().await);
 
@@ -814,14 +927,13 @@ pub(crate) async fn download_parallel_resumable_to_file(
             chunks: Arc::clone(&chunks),
             trusted_chunks: Arc::clone(&trusted_chunks),
             std_file: Arc::clone(&std_file),
-            progress: progress.clone(),
+            callbacks: callbacks.clone(),
             progress_total: progress_total.clone(),
             progress_reported: progress_reported.clone(),
             mac: Arc::clone(&mac),
             aes_key,
             aes_iv: aes_iv_16,
             aes_iv_8,
-            chunk_verified: chunk_verified.clone(),
         };
         workers.push(stream_download_worker_to_file(client, ctx));
     }
