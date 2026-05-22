@@ -142,6 +142,18 @@ impl HttpClient for reqwest::Client {
         Ok(Box::pin(stream))
     }
 
+    async fn get_str(&self, url: &str) -> Result<HttpGetStream> {
+        let stream = self
+            .get(url)
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes_stream()
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err));
+
+        Ok(Box::pin(stream))
+    }
+
     async fn post(
         &self,
         url: Url,

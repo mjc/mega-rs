@@ -305,8 +305,7 @@ async fn download_worker(client: &dyn HttpClient, ctx: DownloadContext) -> Resul
         }
 
         range.write_url(&ctx.base_url, &mut url_buffer);
-        let url = url_buffer.parse()?;
-        let mut response = client.get(url).await?;
+        let mut response = client.get_str(&url_buffer).await?;
         let mut bytes_read = 0;
 
         while let Some(chunk) = response.try_next().await? {
@@ -442,13 +441,7 @@ async fn stream_download_worker_to_file(
     ctx: StreamingFileDownloadContext,
 ) -> Result<()> {
     let mut url_buffer = String::with_capacity(ctx.base_url.len() + 48);
-    let max_chunk_len = ctx
-        .chunks
-        .iter()
-        .map(|chunk| chunk.length as usize)
-        .max()
-        .unwrap_or(0);
-    let mut plaintext = Vec::with_capacity(max_chunk_len);
+    let mut plaintext = Vec::new();
 
     loop {
         let idx = ctx.next_chunk.fetch_add(1, Ordering::Relaxed);
@@ -464,12 +457,10 @@ async fn stream_download_worker_to_file(
         }
 
         range.write_url(&ctx.base_url, &mut url_buffer);
-        let url = url_buffer.parse()?;
-        let mut response = client.get(url).await?;
+        let mut response = client.get_str(&url_buffer).await?;
         let mut remaining = range.length as usize;
         let mut file_offset = range.offset;
         let mut chunk_mac = MegaChunkMac::new(&ctx.aes_key, &ctx.aes_iv_8);
-        reserve_plaintext_buffer(&mut plaintext, remaining);
 
         while let Some(bytes) = response.try_next().await? {
             let read_len = bytes.len();
@@ -484,11 +475,13 @@ async fn stream_download_worker_to_file(
                 .into());
             }
 
-            let start = plaintext.len();
+            reserve_plaintext_buffer(&mut plaintext, read_len);
             plaintext.extend_from_slice(&bytes);
-            let chunk = &mut plaintext[start..];
-            decrypt(&ctx.aes_key, &ctx.aes_iv, file_offset, chunk);
-            chunk_mac.update(chunk);
+            decrypt(&ctx.aes_key, &ctx.aes_iv, file_offset, &mut plaintext);
+            chunk_mac.update(&plaintext);
+            tokio::task::block_in_place(|| {
+                write_all_at_blocking(&ctx.std_file, file_offset, &plaintext)
+            })?;
 
             file_offset += read_len as u64;
             remaining -= read_len;
@@ -512,10 +505,6 @@ async fn stream_download_worker_to_file(
         let chunk_index = range.index;
         let chunk_mac = chunk_mac.finalize();
         ctx.mac.set_chunk_mac(chunk_index as usize, chunk_mac);
-
-        tokio::task::block_in_place(|| {
-            write_all_at_blocking(&ctx.std_file, range.offset, &plaintext)
-        })?;
 
         if let Some(ref cb) = ctx.callbacks {
             cb.chunk_verified(chunk_index, chunk_mac);

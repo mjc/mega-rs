@@ -71,6 +71,11 @@ pub trait HttpClient: Send + Sync {
     /// Initiates a simple GET request, returning the response body as byte chunks.
     async fn get(&self, url: Url) -> Result<HttpGetStream>;
 
+    /// Initiates a simple GET request from an already formatted URL string.
+    async fn get_str(&self, url: &str) -> Result<HttpGetStream> {
+        self.get(Url::parse(url)?).await
+    }
+
     /// Initiates a simple POST request, with body and optional `content-length`, returning the response body as a reader.
     async fn post(
         &self,
