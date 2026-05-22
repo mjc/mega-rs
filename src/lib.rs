@@ -1215,12 +1215,30 @@ impl Client {
             futures::pin_mut!(condensed_mac_writer);
 
             while let Some(chunk) = body.try_next().await? {
+                let next_total =
+                    total_written
+                        .checked_add(chunk.len() as u64)
+                        .ok_or_else(|| {
+                            Error::from(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "download body length overflowed u64",
+                            ))
+                        })?;
+                if next_total > size {
+                    return Err(Error::from(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "download body exceeded expected length: expected {size} bytes, got at least {next_total} bytes"
+                        ),
+                    )));
+                }
+
                 let mut buffer = chunk.to_vec();
                 ctr.apply_keystream(&mut buffer);
                 writer.write_all(&buffer).await?;
                 condensed_mac_writer.write_all(&buffer).await?;
 
-                total_written += buffer.len() as u64;
+                total_written = next_total;
                 if let Some(ref cb) = progress {
                     cb(total_written);
                 }
@@ -1260,11 +1278,11 @@ impl Client {
     ///
     /// This method is optimized for larger files where bandwidth efficiency matters.
     /// It downloads file chunks in parallel while maintaining the integrity of the file
-    /// through concurrent MAC verification, with peak memory roughly `2 × num_workers × CHUNK_SIZE`
-    /// (each worker’s read buffer plus the channel’s queued chunks).
+    /// through concurrent MAC verification, with peak memory roughly twice the
+    /// number of workers times the largest MEGA MAC chunk size.
     ///
     /// **Architecture:**
-    /// - Multiple download workers fetch 32MB chunks concurrently from the server
+    /// - Multiple download workers fetch MEGA MAC chunks concurrently from the server
     /// - Downloaded chunks are buffered in-flight but immediately decrypted and written as available
     /// - A single processor task handles decryption, file writing, and MAC computation
     /// - MAC verification uses concurrent data structures to store only 16-byte MACs per MEGA chunk
@@ -1272,11 +1290,11 @@ impl Client {
     ///
     /// # Arguments
     /// * `node` - The node to download
-    /// * `writer` - An async writer that supports seeking (e.g., any `futures::io::AsyncWrite + AsyncSeek`)
+    /// * `writer` - An async writer that supports seeking (e.g., any `tokio::io::AsyncWrite + AsyncSeek`)
     /// * `num_connections` - Number of parallel download workers (recommended: 4-8 for optimal throughput)
     ///
     /// # Errors
-    /// * [`Error::ParallelismTooHigh`] if you request more than 32 workers (to keep memory bounded).
+    /// * [`Error::ParallelismTooHigh`] if you request more than 16 workers (to keep memory bounded).
     #[cfg(feature = "parallel")]
     pub async fn download_node_parallel<W>(
         &self,

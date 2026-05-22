@@ -49,6 +49,10 @@ pub trait ParallelDownloadCallbacks: Send + Sync {
 
     fn chunk_verified(&self, _index: u32, _mac: [u8; 16]) {}
 
+    fn tracks_chunk_verification(&self) -> bool {
+        true
+    }
+
     fn tracks_progress(&self) -> bool {
         true
     }
@@ -74,6 +78,10 @@ impl ParallelDownloadCallbacks for FnDownloadCallbacks {
 
     fn tracks_progress(&self) -> bool {
         self.progress.is_some()
+    }
+
+    fn tracks_chunk_verification(&self) -> bool {
+        self.chunk_verified.is_some()
     }
 }
 
@@ -266,6 +274,12 @@ fn reserve_plaintext_buffer(buffer: &mut Vec<u8>, target_size: usize) {
     buffer.clear();
 }
 
+async fn sync_std_file_data(std_file: Arc<StdFile>) -> io::Result<()> {
+    tokio::task::spawn_blocking(move || std_file.sync_data())
+        .await
+        .map_err(|e| io::Error::other(format!("file sync task failed: {e}")))?
+}
+
 // ============================================================================
 // Download worker
 // ============================================================================
@@ -398,8 +412,11 @@ where
 
         // File-backed writers can bypass Tokio's buffered async file adapter here.
         data = writer.write_chunk(offset, data).await?;
-        writer.flush().await?;
         if let Some(ref cb) = callbacks {
+            if cb.tracks_chunk_verification() {
+                writer.flush().await?;
+                writer.sync_data().await?;
+            }
             cb.chunk_verified(chunk_index, chunk_mac);
         }
         if let Some(ref total) = progress_total {
@@ -517,6 +534,9 @@ async fn stream_download_worker_to_file(
         ctx.mac.set_chunk_mac(chunk_index as usize, chunk_mac);
 
         if let Some(ref cb) = ctx.callbacks {
+            if cb.tracks_chunk_verification() {
+                sync_std_file_data(Arc::clone(&ctx.std_file)).await?;
+            }
             cb.chunk_verified(chunk_index, chunk_mac);
         }
         if let Some(ref total) = ctx.progress_total {
@@ -708,9 +728,9 @@ where
     let base_url: Arc<str> = base_url.into();
 
     // Channel: downloaders → processor
-    // Bounded to num_workers so each worker can have at most one queued chunk while
-    // downloading the next. Peak memory: ~num_workers * CHUNK_SIZE queued + num_workers
-    // in-flight downloads, i.e. ~2 * num_workers * CHUNK_SIZE total.
+    // Bounded to num_workers so each worker can have at most one queued MEGA
+    // MAC chunk while downloading the next. Peak memory is roughly two chunks
+    // per worker.
     let (tx, rx) = mpsc::channel::<DownloadedChunk>(num_workers);
 
     // Progress callback with cumulative tracking and monotonic reporting
@@ -950,7 +970,7 @@ pub(crate) async fn download_parallel_resumable_to_file_with_callbacks(
 
     let computed_mac = mac.finalize().ok_or(Error::CondensedMacMismatch)?;
     if computed_mac == expected_mac {
-        std_file.sync_data()?;
+        sync_std_file_data(std_file).await?;
         Ok(())
     } else {
         Err(Error::CondensedMacMismatch)
@@ -1642,7 +1662,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chunk_verified_runs_after_flush_without_sync() {
+    async fn chunk_verified_runs_after_durable_sync() {
         let key = [0x42u8; 16];
         let iv = [0x13u8; 16];
         let iv8 = [0x13u8; 8];
@@ -1689,14 +1709,17 @@ mod tests {
         .unwrap();
 
         assert_eq!(writer.bytes(), plaintext);
-        assert_eq!(writer.sync_calls(), 1);
+        assert_eq!(writer.sync_calls(), 2);
         let writer_journal = writer.journal();
-        assert_eq!(writer_journal.as_slice(), &["flush", "flush", "sync"]);
+        assert_eq!(
+            writer_journal.as_slice(),
+            &["flush", "sync", "flush", "sync"]
+        );
         assert_eq!(callback_events.lock().unwrap().as_slice(), &["callback"]);
     }
 
     #[tokio::test]
-    async fn chunk_verified_is_reported_even_if_sync_would_fail() {
+    async fn chunk_verified_is_not_reported_if_sync_fails() {
         let key = [0x33u8; 16];
         let iv = [0x19u8; 16];
         let iv8 = [0x19u8; 8];
@@ -1744,7 +1767,7 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(writer.bytes(), plaintext);
-        assert_eq!(*callback_count.lock().unwrap(), 1);
+        assert_eq!(*callback_count.lock().unwrap(), 0);
         assert!(matches!(err, Error::IoError { .. }));
     }
 
