@@ -4,7 +4,9 @@ use std::pin::pin;
 
 use aes::Aes128;
 use base64::prelude::{Engine, BASE64_URL_SAFE_NO_PAD};
-use cipher::{BlockEncrypt, KeyInit};
+use cipher::{
+    typenum::U16, Block, BlockBackend, BlockClosure, BlockEncrypt, BlockSizeUser, KeyInit,
+};
 use futures::io::{AsyncRead, AsyncReadExt};
 
 #[cfg(feature = "parallel")]
@@ -548,16 +550,10 @@ impl MegaChunkMac {
             }
         }
 
-        let mut blocks = data.chunks_exact(16);
-        for block in &mut blocks {
-            encrypt_cbc_block(
-                &self.aes,
-                &mut self.cur_mac,
-                block.try_into().expect("16-byte block"),
-            );
-        }
+        let block_len = data.len() - (data.len() % 16);
+        let (blocks, leftover) = data.split_at(block_len);
+        encrypt_cbc_blocks(&self.aes, &mut self.cur_mac, blocks);
 
-        let leftover = blocks.remainder();
         if !leftover.is_empty() {
             self.partial[..leftover.len()].copy_from_slice(leftover);
             self.partial_len = leftover.len();
@@ -582,9 +578,7 @@ fn compute_chunk_mac_with_cipher(
     leftover: &[u8],
 ) -> [u8; 16] {
     let mut cur_mac = *aes_iv;
-    for block in blocks.chunks_exact(16) {
-        encrypt_cbc_block(aes, &mut cur_mac, block.try_into().expect("16-byte block"));
-    }
+    encrypt_cbc_blocks(aes, &mut cur_mac, blocks);
 
     if !leftover.is_empty() {
         let mut padded = [0u8; 16];
@@ -600,6 +594,41 @@ fn encrypt_cbc_block(aes: &Aes128, state: &mut [u8; 16], input: &[u8; 16]) {
         *dst ^= *src;
     }
     aes.encrypt_block(state.into());
+}
+
+struct CbcMacBlocks<'a, 'b> {
+    state: &'a mut [u8; 16],
+    blocks: &'b [u8],
+}
+
+impl BlockSizeUser for CbcMacBlocks<'_, '_> {
+    type BlockSize = U16;
+}
+
+impl BlockClosure for CbcMacBlocks<'_, '_> {
+    #[inline(always)]
+    fn call<B: BlockBackend<BlockSize = U16>>(self, backend: &mut B) {
+        let mut state = Block::<B>::clone_from_slice(self.state);
+        let mut offset = 0;
+        while offset < self.blocks.len() {
+            // SAFETY: callers pass only complete 16-byte block runs. `[u8; 16]`
+            // has byte alignment, so unaligned input slices are fine.
+            let input = unsafe { &*self.blocks.as_ptr().add(offset).cast::<[u8; 16]>() };
+            for (dst, src) in state.iter_mut().zip(input) {
+                *dst ^= *src;
+            }
+            backend.proc_block_inplace(&mut state);
+            offset += 16;
+        }
+        self.state.copy_from_slice(&state);
+    }
+}
+
+fn encrypt_cbc_blocks(aes: &Aes128, state: &mut [u8; 16], blocks: &[u8]) {
+    debug_assert_eq!(blocks.len() % 16, 0);
+    if !blocks.is_empty() {
+        aes.encrypt_with_backend(CbcMacBlocks { state, blocks });
+    }
 }
 
 #[cfg(feature = "parallel")]
