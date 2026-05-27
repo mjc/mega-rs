@@ -32,8 +32,24 @@ use crate::Node;
 
 /// Maximum number of workers we will spawn to keep RAM bounded.
 const MAX_PARALLEL_WORKERS: usize = 16;
-/// Claim multiple adjacent MEGA MAC chunks per HTTP request to reduce request churn.
-const MAX_MEGA_CHUNKS_PER_REQUEST: usize = 8;
+/// Default adjacent MEGA MAC chunks to claim per HTTP request.
+const DEFAULT_MAX_MEGA_CHUNKS_PER_REQUEST: usize = 2;
+/// Runtime override cap so tuning cannot silently explode request sizes.
+const MAX_MEGA_CHUNKS_PER_REQUEST_CAP: usize = 8;
+const MAX_MEGA_CHUNKS_PER_REQUEST_ENV: &str = "MEGA_MAX_CHUNKS_PER_REQUEST";
+
+fn parse_max_mega_chunks_per_request(value: Option<&str>) -> usize {
+    value
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .map(|value| value.min(MAX_MEGA_CHUNKS_PER_REQUEST_CAP))
+        .unwrap_or(DEFAULT_MAX_MEGA_CHUNKS_PER_REQUEST)
+}
+
+fn max_mega_chunks_per_request() -> usize {
+    let env_override = std::env::var(MAX_MEGA_CHUNKS_PER_REQUEST_ENV).ok();
+    parse_max_mega_chunks_per_request(env_override.as_deref())
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MegaChunkRun {
@@ -336,6 +352,7 @@ struct DownloadContext {
     claim_cursor: Arc<ChunkClaimCursor>,
     chunks: Arc<[MegaChunk]>,
     trusted_chunks: Arc<[Option<[u8; 16]>]>,
+    max_chunks_per_request: usize,
     buffer_pool: Arc<ChunkBufferPool>,
     tx: mpsc::Sender<DownloadedChunk>,
 }
@@ -356,11 +373,10 @@ fn resize_download_buffer(buffer_pool: &ChunkBufferPool, target_size: usize) -> 
 async fn download_worker(client: &dyn HttpClient, ctx: DownloadContext) -> Result<()> {
     let mut url_buffer = String::with_capacity(ctx.base_url.len() + 48);
     loop {
-        let Some(run) = ctx.claim_cursor.claim(
-            &ctx.chunks,
-            &ctx.trusted_chunks,
-            MAX_MEGA_CHUNKS_PER_REQUEST,
-        ) else {
+        let Some(run) =
+            ctx.claim_cursor
+                .claim(&ctx.chunks, &ctx.trusted_chunks, ctx.max_chunks_per_request)
+        else {
             break;
         };
 
@@ -515,6 +531,7 @@ struct StreamingFileDownloadContext {
     claim_cursor: Arc<ChunkClaimCursor>,
     chunks: Arc<[MegaChunk]>,
     trusted_chunks: Arc<[Option<[u8; 16]>]>,
+    max_chunks_per_request: usize,
     std_file: Arc<StdFile>,
     callbacks: Option<Arc<dyn ParallelDownloadCallbacks>>,
     progress_total: Option<Arc<AtomicU64>>,
@@ -533,11 +550,10 @@ async fn stream_download_worker_to_file(
     let mut plaintext = Vec::new();
 
     loop {
-        let Some(run) = ctx.claim_cursor.claim(
-            &ctx.chunks,
-            &ctx.trusted_chunks,
-            MAX_MEGA_CHUNKS_PER_REQUEST,
-        ) else {
+        let Some(run) =
+            ctx.claim_cursor
+                .claim(&ctx.chunks, &ctx.trusted_chunks, ctx.max_chunks_per_request)
+        else {
             break;
         };
 
@@ -818,6 +834,7 @@ where
     let num_workers = requested_workers.min(untrusted_chunks);
     let claim_cursor = Arc::new(ChunkClaimCursor::default());
     let base_url: Arc<str> = base_url.into();
+    let max_chunks_per_request = max_mega_chunks_per_request();
 
     // Channel: downloaders → processor
     // Bounded to num_workers so each worker can have at most one queued MEGA
@@ -863,6 +880,7 @@ where
                 claim_cursor: Arc::clone(&claim_cursor),
                 chunks: Arc::clone(&chunks),
                 trusted_chunks: Arc::clone(&trusted_chunks),
+                max_chunks_per_request,
                 buffer_pool: Arc::clone(&buffer_pool),
                 tx: tx.clone(),
             };
@@ -1028,6 +1046,7 @@ pub(crate) async fn download_parallel_resumable_to_file_with_callbacks(
     let num_workers = requested_workers.min(untrusted_chunks);
     let claim_cursor = Arc::new(ChunkClaimCursor::default());
     let base_url: Arc<str> = base_url.into();
+    let max_chunks_per_request = max_mega_chunks_per_request();
     let progress_total = callbacks
         .as_ref()
         .filter(|cb| cb.tracks_progress())
@@ -1045,6 +1064,7 @@ pub(crate) async fn download_parallel_resumable_to_file_with_callbacks(
             claim_cursor: Arc::clone(&claim_cursor),
             chunks: Arc::clone(&chunks),
             trusted_chunks: Arc::clone(&trusted_chunks),
+            max_chunks_per_request,
             std_file: Arc::clone(&std_file),
             callbacks: callbacks.clone(),
             progress_total: progress_total.clone(),
@@ -1208,6 +1228,17 @@ mod tests {
         assert_eq!(buffer.as_ptr(), ptr);
         buffer.extend_from_slice(&[1, 2, 3]);
         assert_eq!(buffer, [1, 2, 3]);
+    }
+
+    #[test]
+    fn parses_runtime_batch_override() {
+        assert_eq!(parse_max_mega_chunks_per_request(None), 2);
+        assert_eq!(parse_max_mega_chunks_per_request(Some("")), 2);
+        assert_eq!(parse_max_mega_chunks_per_request(Some("0")), 2);
+        assert_eq!(parse_max_mega_chunks_per_request(Some("2")), 2);
+        assert_eq!(parse_max_mega_chunks_per_request(Some(" 4 ")), 4);
+        assert_eq!(parse_max_mega_chunks_per_request(Some("99")), 8);
+        assert_eq!(parse_max_mega_chunks_per_request(Some("garbage")), 2);
     }
 
     #[derive(Clone, Default)]
