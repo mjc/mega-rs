@@ -540,7 +540,7 @@ async fn stream_download_worker_to_file(
     ctx: StreamingFileDownloadContext,
 ) -> Result<()> {
     let mut url_buffer = String::with_capacity(ctx.base_url.len() + 48);
-    let mut plaintext = Vec::new();
+    let mut chunk_buffer = Vec::new();
 
     loop {
         let Some(run) =
@@ -556,8 +556,7 @@ async fn stream_download_worker_to_file(
         let mut current_chunk = ctx.chunks[current_idx];
         let mut remaining_in_chunk = current_chunk.length as usize;
         let mut batch_remaining = run.total_length(&ctx.chunks) as usize;
-        let mut file_offset = current_chunk.offset;
-        let mut chunk_mac = MegaChunkMac::new(&ctx.aes_key, &ctx.aes_iv_8);
+        reserve_plaintext_buffer(&mut chunk_buffer, current_chunk.length as usize);
 
         'response: while let Some(bytes) = response.try_next().await? {
             let mut bytes = bytes.as_ref();
@@ -572,36 +571,36 @@ async fn stream_download_worker_to_file(
 
                 let read_len = remaining_in_chunk.min(bytes.len());
                 let (segment, rest) = bytes.split_at(read_len);
-                reserve_plaintext_buffer(&mut plaintext, read_len);
-                plaintext.extend_from_slice(segment);
-                decrypt(&ctx.aes_key, &ctx.aes_iv, file_offset, &mut plaintext);
-                chunk_mac.update(&plaintext);
-                plaintext = tokio::task::spawn_blocking({
-                    let std_file = Arc::clone(&ctx.std_file);
-                    let write_offset = file_offset;
-                    let plaintext = std::mem::take(&mut plaintext);
-                    move || -> std::io::Result<Vec<u8>> {
-                        write_all_at_blocking(&std_file, write_offset, &plaintext)?;
-                        Ok(plaintext)
-                    }
-                })
-                .await
-                .map_err(|e| {
-                    std::io::Error::other(format!("positioned write task failed: {e}"))
-                })??;
-
-                file_offset += read_len as u64;
+                chunk_buffer.extend_from_slice(segment);
+                bytes = rest;
                 remaining_in_chunk -= read_len;
                 batch_remaining -= read_len;
-                bytes = rest;
 
                 if remaining_in_chunk == 0 {
+                    decrypt(
+                        &ctx.aes_key,
+                        &ctx.aes_iv,
+                        current_chunk.offset,
+                        &mut chunk_buffer,
+                    );
+                    let mut chunk_mac = MegaChunkMac::new(&ctx.aes_key, &ctx.aes_iv_8);
+                    chunk_mac.update(&chunk_buffer);
+                    let finalized_mac = chunk_mac.finalize();
+                    chunk_buffer = tokio::task::spawn_blocking({
+                        let std_file = Arc::clone(&ctx.std_file);
+                        let write_offset = current_chunk.offset;
+                        let plaintext = std::mem::take(&mut chunk_buffer);
+                        move || -> std::io::Result<Vec<u8>> {
+                            write_all_at_blocking(&std_file, write_offset, &plaintext)?;
+                            Ok(plaintext)
+                        }
+                    })
+                    .await
+                    .map_err(|e| {
+                        std::io::Error::other(format!("positioned write task failed: {e}"))
+                    })??;
+
                     let chunk_index = current_chunk.index;
-                    let finalized_mac = std::mem::replace(
-                        &mut chunk_mac,
-                        MegaChunkMac::new(&ctx.aes_key, &ctx.aes_iv_8),
-                    )
-                    .finalize();
                     ctx.mac.set_chunk_mac(chunk_index as usize, finalized_mac);
 
                     if let Some(ref cb) = ctx.callbacks {
@@ -637,6 +636,7 @@ async fn stream_download_worker_to_file(
 
                     current_chunk = ctx.chunks[current_idx];
                     remaining_in_chunk = current_chunk.length as usize;
+                    reserve_plaintext_buffer(&mut chunk_buffer, current_chunk.length as usize);
                 }
             }
         }
@@ -1353,6 +1353,31 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingCallbacks {
+        verified_chunks: Mutex<Vec<u32>>,
+    }
+
+    impl RecordingCallbacks {
+        fn verified_chunks(&self) -> Vec<u32> {
+            self.verified_chunks.lock().unwrap().clone()
+        }
+    }
+
+    impl ParallelDownloadCallbacks for RecordingCallbacks {
+        fn chunk_verified(&self, index: u32, _mac: [u8; 16]) {
+            self.verified_chunks.lock().unwrap().push(index);
+        }
+
+        fn tracks_chunk_verification(&self) -> bool {
+            false
+        }
+
+        fn tracks_progress(&self) -> bool {
+            false
+        }
+    }
+
     struct MockHttpClient {
         encrypted: Vec<u8>,
         requests: Arc<Mutex<Vec<(u64, u64)>>>,
@@ -1908,6 +1933,54 @@ mod tests {
         let bytes = tokio::fs::read(&path).await.unwrap();
         let _ = tokio::fs::remove_file(&path).await;
         assert_eq!(bytes, fixture.plaintext);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resumable_streaming_file_path_reports_chunk_verified_for_fragmented_frames() {
+        let fixture = resumable_fixture(800_000);
+        let http = MockHttpClient::new(fixture.encrypted.clone()).with_fragment_size(8191);
+        let callbacks = Arc::new(RecordingCallbacks::default());
+        let path = std::env::temp_dir().join(format!(
+            "mega-parallel-verified-{}-{}.part",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .read(true)
+            .open(&path)
+            .await
+            .unwrap();
+        file.set_len(fixture.plaintext.len() as u64).await.unwrap();
+
+        download_parallel_resumable_to_file_with_callbacks(
+            &http,
+            &fixture.node,
+            "http://example.test/file".to_string(),
+            fixture.plaintext.len() as u64,
+            file,
+            1,
+            None,
+            None,
+            Some(callbacks.clone()),
+            *fixture.node.aes_iv.as_ref().unwrap(),
+            *fixture.node.condensed_mac.as_ref().unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let bytes = tokio::fs::read(&path).await.unwrap();
+        let _ = tokio::fs::remove_file(&path).await;
+        assert_eq!(bytes, fixture.plaintext);
+        assert_eq!(
+            callbacks.verified_chunks(),
+            fixture.chunks.iter().map(|chunk| chunk.index).collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
