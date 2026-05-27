@@ -36,19 +36,12 @@ const MAX_PARALLEL_WORKERS: usize = 16;
 const DEFAULT_MAX_MEGA_CHUNKS_PER_REQUEST: usize = 2;
 /// Runtime override cap so tuning cannot silently explode request sizes.
 const MAX_MEGA_CHUNKS_PER_REQUEST_CAP: usize = 8;
-const MAX_MEGA_CHUNKS_PER_REQUEST_ENV: &str = "MEGA_MAX_CHUNKS_PER_REQUEST";
 
-fn parse_max_mega_chunks_per_request(value: Option<&str>) -> usize {
+fn normalize_max_mega_chunks_per_request(value: Option<usize>) -> usize {
     value
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
         .map(|value| value.min(MAX_MEGA_CHUNKS_PER_REQUEST_CAP))
         .unwrap_or(DEFAULT_MAX_MEGA_CHUNKS_PER_REQUEST)
-}
-
-fn max_mega_chunks_per_request() -> usize {
-    let env_override = std::env::var(MAX_MEGA_CHUNKS_PER_REQUEST_ENV).ok();
-    parse_max_mega_chunks_per_request(env_override.as_deref())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -677,6 +670,7 @@ pub(crate) async fn download_parallel<W>(
     server_size: u64,
     writer: W,
     num_connections: usize,
+    max_chunks_per_request: Option<usize>,
     progress_callback: Option<Arc<dyn Fn(u64) + Send + Sync>>,
     aes_iv: [u8; 8],
     expected_mac: [u8; 8],
@@ -691,6 +685,7 @@ where
         server_size,
         NoSyncWriter::new(writer),
         num_connections,
+        max_chunks_per_request,
         progress_callback,
         None,
         None,
@@ -708,6 +703,7 @@ pub(crate) async fn download_parallel_resumable<W>(
     server_size: u64,
     writer: W,
     num_connections: usize,
+    max_chunks_per_request: Option<usize>,
     progress_callback: Option<Arc<dyn Fn(u64) + Send + Sync>>,
     trusted_chunks: Option<Arc<[Option<[u8; 16]>]>>,
     chunk_verified: Option<Arc<dyn Fn(u32, [u8; 16]) + Send + Sync>>,
@@ -725,6 +721,7 @@ where
         server_size,
         writer,
         num_connections,
+        max_chunks_per_request,
         trusted_chunks,
         callbacks,
         aes_iv,
@@ -740,6 +737,7 @@ pub(crate) async fn download_parallel_resumable_with_callbacks<W>(
     server_size: u64,
     writer: W,
     num_connections: usize,
+    max_chunks_per_request: Option<usize>,
     trusted_chunks: Option<Arc<[Option<[u8; 16]>]>>,
     callbacks: Option<Arc<dyn ParallelDownloadCallbacks>>,
     aes_iv: [u8; 8],
@@ -834,7 +832,7 @@ where
     let num_workers = requested_workers.min(untrusted_chunks);
     let claim_cursor = Arc::new(ChunkClaimCursor::default());
     let base_url: Arc<str> = base_url.into();
-    let max_chunks_per_request = max_mega_chunks_per_request();
+    let max_chunks_per_request = normalize_max_mega_chunks_per_request(max_chunks_per_request);
 
     // Channel: downloaders → processor
     // Bounded to num_workers so each worker can have at most one queued MEGA
@@ -927,6 +925,7 @@ pub(crate) async fn download_parallel_resumable_to_file(
     server_size: u64,
     writer: tokio::fs::File,
     num_connections: usize,
+    max_chunks_per_request: Option<usize>,
     progress_callback: Option<Arc<dyn Fn(u64) + Send + Sync>>,
     trusted_chunks: Option<Arc<[Option<[u8; 16]>]>>,
     chunk_verified: Option<Arc<dyn Fn(u32, [u8; 16]) + Send + Sync>>,
@@ -941,6 +940,7 @@ pub(crate) async fn download_parallel_resumable_to_file(
         server_size,
         writer,
         num_connections,
+        max_chunks_per_request,
         trusted_chunks,
         callbacks,
         aes_iv,
@@ -956,6 +956,7 @@ pub(crate) async fn download_parallel_resumable_to_file_with_callbacks(
     server_size: u64,
     writer: tokio::fs::File,
     num_connections: usize,
+    max_chunks_per_request: Option<usize>,
     trusted_chunks: Option<Arc<[Option<[u8; 16]>]>>,
     callbacks: Option<Arc<dyn ParallelDownloadCallbacks>>,
     aes_iv: [u8; 8],
@@ -1046,7 +1047,7 @@ pub(crate) async fn download_parallel_resumable_to_file_with_callbacks(
     let num_workers = requested_workers.min(untrusted_chunks);
     let claim_cursor = Arc::new(ChunkClaimCursor::default());
     let base_url: Arc<str> = base_url.into();
-    let max_chunks_per_request = max_mega_chunks_per_request();
+    let max_chunks_per_request = normalize_max_mega_chunks_per_request(max_chunks_per_request);
     let progress_total = callbacks
         .as_ref()
         .filter(|cb| cb.tracks_progress())
@@ -1231,14 +1232,12 @@ mod tests {
     }
 
     #[test]
-    fn parses_runtime_batch_override() {
-        assert_eq!(parse_max_mega_chunks_per_request(None), 2);
-        assert_eq!(parse_max_mega_chunks_per_request(Some("")), 2);
-        assert_eq!(parse_max_mega_chunks_per_request(Some("0")), 2);
-        assert_eq!(parse_max_mega_chunks_per_request(Some("2")), 2);
-        assert_eq!(parse_max_mega_chunks_per_request(Some(" 4 ")), 4);
-        assert_eq!(parse_max_mega_chunks_per_request(Some("99")), 8);
-        assert_eq!(parse_max_mega_chunks_per_request(Some("garbage")), 2);
+    fn normalizes_batch_override() {
+        assert_eq!(normalize_max_mega_chunks_per_request(None), 2);
+        assert_eq!(normalize_max_mega_chunks_per_request(Some(0)), 2);
+        assert_eq!(normalize_max_mega_chunks_per_request(Some(2)), 2);
+        assert_eq!(normalize_max_mega_chunks_per_request(Some(4)), 4);
+        assert_eq!(normalize_max_mega_chunks_per_request(Some(99)), 8);
     }
 
     #[derive(Clone, Default)]
@@ -1596,6 +1595,7 @@ mod tests {
             writer.clone(),
             4,
             None,
+            None,
             Some(trusted.into()),
             None,
             *fixture.node.aes_iv.as_ref().unwrap(),
@@ -1629,6 +1629,7 @@ mod tests {
             writer.clone(),
             3,
             None,
+            None,
             Some(trusted.into()),
             None,
             *fixture.node.aes_iv.as_ref().unwrap(),
@@ -1655,6 +1656,7 @@ mod tests {
             fixture.plaintext.len() as u64,
             writer,
             4,
+            None,
             None,
             Some(trusted.into()),
             None,
@@ -1683,6 +1685,7 @@ mod tests {
             fixture.plaintext.len() as u64,
             writer,
             4,
+            None,
             None,
             Some(trusted.into()),
             None,
@@ -1713,6 +1716,7 @@ mod tests {
             fixture.plaintext.len() as u64,
             writer,
             1,
+            None,
             Some(Arc::new(move |bytes| {
                 progress_for_cb.lock().unwrap().push(bytes);
             })),
@@ -1746,6 +1750,7 @@ mod tests {
             fixture.plaintext.len() as u64,
             writer.clone(),
             1,
+            None,
             None,
             None,
             None,
@@ -1803,6 +1808,7 @@ mod tests {
             file,
             3,
             None,
+            None,
             Some(trusted.into()),
             None,
             *fixture.node.aes_iv.as_ref().unwrap(),
@@ -1848,6 +1854,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             *fixture.node.aes_iv.as_ref().unwrap(),
             *fixture.node.condensed_mac.as_ref().unwrap(),
         )
@@ -1888,6 +1895,7 @@ mod tests {
             fixture.plaintext.len() as u64,
             file,
             1,
+            None,
             None,
             None,
             None,
@@ -1940,6 +1948,7 @@ mod tests {
             fixture.plaintext.len() as u64,
             file,
             1,
+            None,
             None,
             Some(trusted.into()),
             None,
@@ -2102,6 +2111,7 @@ mod tests {
                 fixture.plaintext.len() as u64,
                 file,
                 3,
+                None,
                 None,
                 None,
                 None,
