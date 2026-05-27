@@ -11,7 +11,7 @@ use std::io;
 use std::io::SeekFrom;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use aes::Aes128;
@@ -32,6 +32,70 @@ use crate::Node;
 
 /// Maximum number of workers we will spawn to keep RAM bounded.
 const MAX_PARALLEL_WORKERS: usize = 16;
+/// Claim multiple adjacent MEGA MAC chunks per HTTP request to reduce request churn.
+const MAX_MEGA_CHUNKS_PER_REQUEST: usize = 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MegaChunkRun {
+    start: usize,
+    end: usize,
+}
+
+impl MegaChunkRun {
+    fn first(self, chunks: &[MegaChunk]) -> MegaChunk {
+        chunks[self.start]
+    }
+
+    fn last(self, chunks: &[MegaChunk]) -> MegaChunk {
+        chunks[self.end - 1]
+    }
+
+    fn total_length(self, chunks: &[MegaChunk]) -> u64 {
+        let first = self.first(chunks);
+        self.last(chunks).end() - first.offset
+    }
+
+    fn write_url(self, chunks: &[MegaChunk], base_url: &str, output: &mut String) {
+        let first = self.first(chunks);
+        let last = self.last(chunks);
+        output.clear();
+        output.push_str(base_url);
+        output.push('/');
+        let _ = write!(output, "{}-{}", first.offset, last.end().saturating_sub(1));
+    }
+}
+
+#[derive(Default)]
+struct ChunkClaimCursor {
+    next: Mutex<usize>,
+}
+
+impl ChunkClaimCursor {
+    fn claim(
+        &self,
+        chunks: &[MegaChunk],
+        trusted_chunks: &[Option<[u8; 16]>],
+        max_chunks_per_request: usize,
+    ) -> Option<MegaChunkRun> {
+        let mut next = self.next.lock().unwrap();
+        while *next < chunks.len() && trusted_chunks[*next].is_some() {
+            *next += 1;
+        }
+
+        if *next >= chunks.len() {
+            return None;
+        }
+
+        let start = *next;
+        let max_end = chunks.len().min(start + max_chunks_per_request.max(1));
+        let mut end = start + 1;
+        while end < max_end && trusted_chunks[end].is_none() {
+            end += 1;
+        }
+        *next = end;
+        Some(MegaChunkRun { start, end })
+    }
+}
 
 #[async_trait]
 pub trait ParallelDownloadWriter: AsyncWrite + AsyncSeek + Unpin + Send {
@@ -199,13 +263,6 @@ impl MegaChunk {
     fn end(&self) -> u64 {
         self.offset + self.length
     }
-
-    fn write_url(&self, base_url: &str, output: &mut String) {
-        output.clear();
-        output.push_str(base_url);
-        output.push('/');
-        let _ = write!(output, "{}-{}", self.offset, self.end().saturating_sub(1));
-    }
 }
 
 // ============================================================================
@@ -276,82 +333,105 @@ async fn sync_std_file_data(std_file: Arc<StdFile>) -> io::Result<()> {
 
 struct DownloadContext {
     base_url: Arc<str>,
-    next_chunk: Arc<AtomicU64>,
+    claim_cursor: Arc<ChunkClaimCursor>,
     chunks: Arc<[MegaChunk]>,
     trusted_chunks: Arc<[Option<[u8; 16]>]>,
     buffer_pool: Arc<ChunkBufferPool>,
     tx: mpsc::Sender<DownloadedChunk>,
 }
 
+fn resize_download_buffer(buffer_pool: &ChunkBufferPool, target_size: usize) -> Vec<u8> {
+    let mut buffer = buffer_pool.acquire();
+    if buffer.capacity() < target_size {
+        buffer.reserve(target_size - buffer.capacity());
+    }
+    if buffer.len() < target_size {
+        buffer.resize(target_size, 0);
+    } else {
+        buffer.truncate(target_size);
+    }
+    buffer
+}
+
 async fn download_worker(client: &dyn HttpClient, ctx: DownloadContext) -> Result<()> {
     let mut url_buffer = String::with_capacity(ctx.base_url.len() + 48);
     loop {
-        let idx = ctx.next_chunk.fetch_add(1, Ordering::Relaxed);
-        let Some(range) = ctx.chunks.get(idx as usize).copied() else {
+        let Some(run) = ctx.claim_cursor.claim(
+            &ctx.chunks,
+            &ctx.trusted_chunks,
+            MAX_MEGA_CHUNKS_PER_REQUEST,
+        ) else {
             break;
         };
-        if ctx
-            .trusted_chunks
-            .get(idx as usize)
-            .is_some_and(Option::is_some)
-        {
-            continue;
-        }
 
-        let target_size = range.length as usize;
-        let mut buffer = ctx.buffer_pool.acquire();
-        if buffer.capacity() < target_size {
-            buffer.reserve(target_size - buffer.capacity());
-        }
-        if buffer.len() < target_size {
-            buffer.resize(target_size, 0);
-        } else {
-            buffer.truncate(target_size);
-        }
-
-        range.write_url(&ctx.base_url, &mut url_buffer);
+        run.write_url(&ctx.chunks, &ctx.base_url, &mut url_buffer);
         let mut response = client.get_str(&url_buffer).await?;
-        let mut bytes_read = 0;
+        let mut current_idx = run.start;
+        let mut current_chunk = ctx.chunks[current_idx];
+        let mut bytes_read = 0usize;
+        let mut buffer = resize_download_buffer(&ctx.buffer_pool, current_chunk.length as usize);
+        let mut batch_remaining = run.total_length(&ctx.chunks) as usize;
 
-        while let Some(chunk) = response.try_next().await? {
-            let chunk = chunk.as_ref();
-            let end = bytes_read + chunk.len();
-            if end > target_size {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "HTTP chunk exceeded expected MEGA range: expected {} bytes, got at least {} bytes",
-                        range.length, end
-                    ),
-                )
-                .into());
-            }
-            buffer[bytes_read..end].copy_from_slice(chunk);
-            bytes_read = end;
-            if bytes_read == target_size {
-                break;
+        'response: while let Some(frame) = response.try_next().await? {
+            let mut frame = frame.as_ref();
+            while !frame.is_empty() {
+                if current_idx >= run.end {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "HTTP response exceeded expected batched MEGA range",
+                    )
+                    .into());
+                }
+
+                let target_size = current_chunk.length as usize;
+                let remaining = target_size - bytes_read;
+                let copy_len = remaining.min(frame.len());
+                let (to_copy, rest) = frame.split_at(copy_len);
+                buffer[bytes_read..bytes_read + copy_len].copy_from_slice(to_copy);
+                bytes_read += copy_len;
+                batch_remaining -= copy_len;
+                frame = rest;
+
+                if bytes_read == target_size {
+                    let data = std::mem::take(&mut buffer);
+                    let chunk = DownloadedChunk {
+                        index: current_chunk.index,
+                        offset: current_chunk.offset,
+                        data,
+                    };
+                    if ctx.tx.send(chunk).await.is_err() {
+                        return Ok(());
+                    }
+
+                    current_idx += 1;
+                    if current_idx == run.end {
+                        if !frame.is_empty() {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "HTTP response exceeded expected batched MEGA range",
+                            )
+                            .into());
+                        }
+                        break 'response;
+                    }
+
+                    current_chunk = ctx.chunks[current_idx];
+                    bytes_read = 0;
+                    buffer =
+                        resize_download_buffer(&ctx.buffer_pool, current_chunk.length as usize);
+                }
             }
         }
 
-        if bytes_read < target_size {
+        if batch_remaining != 0 || current_idx != run.end {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 format!(
-                    "unexpected EOF while reading HTTP chunk: expected {} bytes, got {} bytes",
-                    range.length, bytes_read
+                    "unexpected EOF while reading batched HTTP range: expected {} trailing bytes",
+                    batch_remaining
                 ),
             )
             .into());
-        }
-
-        let chunk = DownloadedChunk {
-            index: range.index,
-            offset: range.offset,
-            data: buffer,
-        };
-
-        if ctx.tx.send(chunk).await.is_err() {
-            break;
         }
     }
     Ok(())
@@ -432,7 +512,7 @@ where
 
 struct StreamingFileDownloadContext {
     base_url: Arc<str>,
-    next_chunk: Arc<AtomicU64>,
+    claim_cursor: Arc<ChunkClaimCursor>,
     chunks: Arc<[MegaChunk]>,
     trusted_chunks: Arc<[Option<[u8; 16]>]>,
     std_file: Arc<StdFile>,
@@ -453,92 +533,114 @@ async fn stream_download_worker_to_file(
     let mut plaintext = Vec::new();
 
     loop {
-        let idx = ctx.next_chunk.fetch_add(1, Ordering::Relaxed);
-        let Some(range) = ctx.chunks.get(idx as usize).copied() else {
+        let Some(run) = ctx.claim_cursor.claim(
+            &ctx.chunks,
+            &ctx.trusted_chunks,
+            MAX_MEGA_CHUNKS_PER_REQUEST,
+        ) else {
             break;
         };
-        if ctx
-            .trusted_chunks
-            .get(idx as usize)
-            .is_some_and(Option::is_some)
-        {
-            continue;
-        }
 
-        range.write_url(&ctx.base_url, &mut url_buffer);
+        run.write_url(&ctx.chunks, &ctx.base_url, &mut url_buffer);
         let mut response = client.get_str(&url_buffer).await?;
-        let mut remaining = range.length as usize;
-        let mut file_offset = range.offset;
+        let mut current_idx = run.start;
+        let mut current_chunk = ctx.chunks[current_idx];
+        let mut remaining_in_chunk = current_chunk.length as usize;
+        let mut batch_remaining = run.total_length(&ctx.chunks) as usize;
+        let mut file_offset = current_chunk.offset;
         let mut chunk_mac = MegaChunkMac::new(&ctx.aes_key, &ctx.aes_iv_8);
 
-        while let Some(bytes) = response.try_next().await? {
-            let read_len = bytes.len();
-            if read_len > remaining {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "HTTP chunk exceeded expected MEGA range: expected {} bytes remaining, got {} bytes",
-                        remaining, read_len
-                    ),
-                )
-                .into());
-            }
-
-            reserve_plaintext_buffer(&mut plaintext, read_len);
-            plaintext.extend_from_slice(&bytes);
-            decrypt(&ctx.aes_key, &ctx.aes_iv, file_offset, &mut plaintext);
-            chunk_mac.update(&plaintext);
-            plaintext = tokio::task::spawn_blocking({
-                let std_file = Arc::clone(&ctx.std_file);
-                let write_offset = file_offset;
-                let plaintext = std::mem::take(&mut plaintext);
-                move || -> std::io::Result<Vec<u8>> {
-                    write_all_at_blocking(&std_file, write_offset, &plaintext)?;
-                    Ok(plaintext)
+        'response: while let Some(bytes) = response.try_next().await? {
+            let mut bytes = bytes.as_ref();
+            while !bytes.is_empty() {
+                if current_idx >= run.end {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "HTTP response exceeded expected batched MEGA range",
+                    )
+                    .into());
                 }
-            })
-            .await
-            .map_err(|e| std::io::Error::other(format!("positioned write task failed: {e}")))??;
 
-            file_offset += read_len as u64;
-            remaining -= read_len;
+                let read_len = remaining_in_chunk.min(bytes.len());
+                let (segment, rest) = bytes.split_at(read_len);
+                reserve_plaintext_buffer(&mut plaintext, read_len);
+                plaintext.extend_from_slice(segment);
+                decrypt(&ctx.aes_key, &ctx.aes_iv, file_offset, &mut plaintext);
+                chunk_mac.update(&plaintext);
+                plaintext = tokio::task::spawn_blocking({
+                    let std_file = Arc::clone(&ctx.std_file);
+                    let write_offset = file_offset;
+                    let plaintext = std::mem::take(&mut plaintext);
+                    move || -> std::io::Result<Vec<u8>> {
+                        write_all_at_blocking(&std_file, write_offset, &plaintext)?;
+                        Ok(plaintext)
+                    }
+                })
+                .await
+                .map_err(|e| {
+                    std::io::Error::other(format!("positioned write task failed: {e}"))
+                })??;
 
-            if remaining == 0 {
-                break;
+                file_offset += read_len as u64;
+                remaining_in_chunk -= read_len;
+                batch_remaining -= read_len;
+                bytes = rest;
+
+                if remaining_in_chunk == 0 {
+                    let chunk_index = current_chunk.index;
+                    let finalized_mac = std::mem::replace(
+                        &mut chunk_mac,
+                        MegaChunkMac::new(&ctx.aes_key, &ctx.aes_iv_8),
+                    )
+                    .finalize();
+                    ctx.mac.set_chunk_mac(chunk_index as usize, finalized_mac);
+
+                    if let Some(ref cb) = ctx.callbacks {
+                        if cb.tracks_chunk_verification() {
+                            sync_std_file_data(Arc::clone(&ctx.std_file)).await?;
+                        }
+                        cb.chunk_verified(chunk_index, finalized_mac);
+                    }
+                    if let Some(ref total) = ctx.progress_total {
+                        let new_total = total.fetch_add(current_chunk.length, Ordering::Relaxed)
+                            + current_chunk.length;
+                        if let Some(ref reported) = ctx.progress_reported {
+                            let prev = reported.fetch_max(new_total, Ordering::Relaxed);
+                            if new_total > prev {
+                                if let Some(ref cb) = ctx.callbacks {
+                                    cb.progress(new_total);
+                                }
+                            }
+                        }
+                    }
+
+                    current_idx += 1;
+                    if current_idx == run.end {
+                        if !bytes.is_empty() {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "HTTP response exceeded expected batched MEGA range",
+                            )
+                            .into());
+                        }
+                        break 'response;
+                    }
+
+                    current_chunk = ctx.chunks[current_idx];
+                    remaining_in_chunk = current_chunk.length as usize;
+                }
             }
         }
 
-        if remaining != 0 {
+        if batch_remaining != 0 || current_idx != run.end {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 format!(
-                    "unexpected EOF while reading HTTP chunk: expected {} trailing bytes",
-                    remaining
+                    "unexpected EOF while reading batched HTTP range: expected {} trailing bytes",
+                    batch_remaining
                 ),
             )
             .into());
-        }
-
-        let chunk_index = range.index;
-        let chunk_mac = chunk_mac.finalize();
-        ctx.mac.set_chunk_mac(chunk_index as usize, chunk_mac);
-
-        if let Some(ref cb) = ctx.callbacks {
-            if cb.tracks_chunk_verification() {
-                sync_std_file_data(Arc::clone(&ctx.std_file)).await?;
-            }
-            cb.chunk_verified(chunk_index, chunk_mac);
-        }
-        if let Some(ref total) = ctx.progress_total {
-            let new_total = total.fetch_add(range.length, Ordering::Relaxed) + range.length;
-            if let Some(ref reported) = ctx.progress_reported {
-                let prev = reported.fetch_max(new_total, Ordering::Relaxed);
-                if new_total > prev {
-                    if let Some(ref cb) = ctx.callbacks {
-                        cb.progress(new_total);
-                    }
-                }
-            }
         }
     }
 
@@ -714,7 +816,7 @@ where
 
     // Cap workers so we never exceed the number of chunks or the configured maximum
     let num_workers = requested_workers.min(untrusted_chunks);
-    let next_chunk = Arc::new(AtomicU64::new(0));
+    let claim_cursor = Arc::new(ChunkClaimCursor::default());
     let base_url: Arc<str> = base_url.into();
 
     // Channel: downloaders → processor
@@ -758,7 +860,7 @@ where
         .map(|_| {
             let ctx = DownloadContext {
                 base_url: Arc::clone(&base_url),
-                next_chunk: Arc::clone(&next_chunk),
+                claim_cursor: Arc::clone(&claim_cursor),
                 chunks: Arc::clone(&chunks),
                 trusted_chunks: Arc::clone(&trusted_chunks),
                 buffer_pool: Arc::clone(&buffer_pool),
@@ -924,7 +1026,7 @@ pub(crate) async fn download_parallel_resumable_to_file_with_callbacks(
     }
 
     let num_workers = requested_workers.min(untrusted_chunks);
-    let next_chunk = Arc::new(AtomicU64::new(0));
+    let claim_cursor = Arc::new(ChunkClaimCursor::default());
     let base_url: Arc<str> = base_url.into();
     let progress_total = callbacks
         .as_ref()
@@ -940,7 +1042,7 @@ pub(crate) async fn download_parallel_resumable_to_file_with_callbacks(
     for _ in 0..num_workers {
         let ctx = StreamingFileDownloadContext {
             base_url: Arc::clone(&base_url),
-            next_chunk: Arc::clone(&next_chunk),
+            claim_cursor: Arc::clone(&claim_cursor),
             chunks: Arc::clone(&chunks),
             trusted_chunks: Arc::clone(&trusted_chunks),
             std_file: Arc::clone(&std_file),
@@ -1443,6 +1545,11 @@ mod tests {
         SharedWriter::with_data(data)
     }
 
+    fn request_overlaps_chunk(request: (u64, u64), chunk: MegaChunk) -> bool {
+        let (start, end) = request;
+        start <= chunk.end().saturating_sub(1) && end >= chunk.offset
+    }
+
     #[tokio::test]
     async fn resumable_skips_trusted_chunks() {
         let fixture = resumable_fixture(800_000);
@@ -1595,6 +1702,35 @@ mod tests {
         assert!(progress.windows(2).all(|window| window[1] > window[0]));
     }
 
+    #[tokio::test]
+    async fn resumable_batches_adjacent_chunks_into_fewer_requests() {
+        let fixture = resumable_fixture(10_000_000);
+        let writer = SharedWriter::default();
+        let http = MockHttpClient::new(fixture.encrypted.clone());
+
+        download_parallel_resumable(
+            &http,
+            &fixture.node,
+            "http://example.test/file".to_string(),
+            fixture.plaintext.len() as u64,
+            writer.clone(),
+            1,
+            None,
+            None,
+            None,
+            *fixture.node.aes_iv.as_ref().unwrap(),
+            *fixture.node.condensed_mac.as_ref().unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let requests = http.requests();
+        assert_eq!(writer.bytes(), fixture.plaintext);
+        assert!(requests.len() < fixture.chunks.len());
+        assert_eq!(requests[0].0, fixture.chunks[0].offset);
+        assert!(requests[0].1 > fixture.chunks[0].end().saturating_sub(1));
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn resumable_streaming_file_path_writes_complete_plaintext() {
         let fixture = resumable_fixture(800_000);
@@ -1690,6 +1826,108 @@ mod tests {
         let bytes = tokio::fs::read(&path).await.unwrap();
         let _ = tokio::fs::remove_file(&path).await;
         assert_eq!(bytes, fixture.plaintext);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resumable_streaming_file_path_handles_frames_crossing_chunk_boundaries() {
+        let fixture = resumable_fixture(10_000_000);
+        let http = MockHttpClient::new(fixture.encrypted.clone()).with_fragment_size(2_000_000);
+        let path = std::env::temp_dir().join(format!(
+            "mega-parallel-crossing-{}-{}.part",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .read(true)
+            .open(&path)
+            .await
+            .unwrap();
+        file.set_len(fixture.plaintext.len() as u64).await.unwrap();
+
+        download_parallel_resumable_to_file(
+            &http,
+            &fixture.node,
+            "http://example.test/file".to_string(),
+            fixture.plaintext.len() as u64,
+            file,
+            1,
+            None,
+            None,
+            None,
+            *fixture.node.aes_iv.as_ref().unwrap(),
+            *fixture.node.condensed_mac.as_ref().unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let bytes = tokio::fs::read(&path).await.unwrap();
+        let _ = tokio::fs::remove_file(&path).await;
+        assert_eq!(bytes, fixture.plaintext);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resumable_streaming_file_path_does_not_batch_across_trusted_holes() {
+        let fixture = resumable_fixture(10_000_000);
+        let trusted_indices = [2usize, 6usize];
+        let trusted = trusted_chunk_macs(&fixture, &trusted_indices);
+        let http = MockHttpClient::new(fixture.encrypted.clone());
+        let path = std::env::temp_dir().join(format!(
+            "mega-parallel-holes-{}-{}.part",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .read(true)
+            .open(&path)
+            .await
+            .unwrap();
+        file.set_len(fixture.plaintext.len() as u64).await.unwrap();
+        let std_file = file.try_clone().await.unwrap().into_std().await;
+        for index in trusted_indices {
+            let chunk = fixture.chunks[index];
+            let start = chunk.offset as usize;
+            let end = (chunk.offset + chunk.length) as usize;
+            write_all_at_blocking(&std_file, chunk.offset, &fixture.plaintext[start..end]).unwrap();
+        }
+
+        download_parallel_resumable_to_file(
+            &http,
+            &fixture.node,
+            "http://example.test/file".to_string(),
+            fixture.plaintext.len() as u64,
+            file,
+            1,
+            None,
+            Some(trusted.into()),
+            None,
+            *fixture.node.aes_iv.as_ref().unwrap(),
+            *fixture.node.condensed_mac.as_ref().unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let requests = http.requests();
+        let bytes = tokio::fs::read(&path).await.unwrap();
+        let _ = tokio::fs::remove_file(&path).await;
+        assert_eq!(bytes, fixture.plaintext);
+        for trusted_index in trusted_indices {
+            let trusted_chunk = fixture.chunks[trusted_index];
+            assert!(requests
+                .iter()
+                .all(|request| !request_overlaps_chunk(*request, trusted_chunk)));
+        }
     }
 
     #[tokio::test]
