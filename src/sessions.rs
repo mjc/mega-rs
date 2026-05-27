@@ -70,10 +70,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn owned_protocol_session_maps_to_public_session_info() {
-        let session = SessionInfo::from(sample_protocol_session());
-
+    fn assert_session_mapped(session: &SessionInfo) {
         assert_eq!(session.id, "abcdef01");
         assert_eq!(
             session.created_at,
@@ -91,23 +88,17 @@ mod tests {
     }
 
     #[test]
+    fn owned_protocol_session_maps_to_public_session_info() {
+        let session = SessionInfo::from(sample_protocol_session());
+
+        assert_session_mapped(&session);
+    }
+
+    #[test]
     fn borrowed_protocol_session_maps_to_public_session_info() {
         let protocol = sample_protocol_session();
         let session = SessionInfo::from(&protocol);
 
-        assert_eq!(session.id, "abcdef01");
-        assert_eq!(
-            session.created_at,
-            Utc.timestamp_opt(1_716_920_000, 0).unwrap()
-        );
-        assert_eq!(
-            session.last_activity_at,
-            Utc.timestamp_opt(1_716_921_111, 0).unwrap()
-        );
-        assert_eq!(session.user_agent, "Firefox");
-        assert_eq!(session.ip, "203.0.113.4");
-        assert_eq!(session.country_code, "US");
-        assert!(session.current);
-        assert!(session.alive);
+        assert_session_mapped(&session);
     }
 }

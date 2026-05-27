@@ -433,11 +433,11 @@ struct SessionInfoObject {
     #[serde(rename = "mru")]
     mru: i64,
     #[serde(rename = "user_agent")]
-    user_agent: String,
+    user_agent: Option<String>,
     #[serde(rename = "ip")]
-    ip: String,
+    ip: Option<String>,
     #[serde(rename = "country")]
-    country: String,
+    country: Option<String>,
     #[serde(rename = "current")]
     current: i32,
     #[serde(rename = "id")]
@@ -492,9 +492,9 @@ impl From<SessionInfoObject> for SessionInfo {
         Self {
             timestamp: value.timestamp,
             mru: value.mru,
-            user_agent: value.user_agent,
-            ip: value.ip,
-            country: value.country,
+            user_agent: value.user_agent.unwrap_or_default(),
+            ip: value.ip.unwrap_or_default(),
+            country: value.country.unwrap_or_default(),
             current: value.current,
             id: value.id,
             alive: value.alive,
@@ -1062,6 +1062,44 @@ mod tests {
         assert_eq!(response.sessions[0].user_agent, "Firefox");
         assert_eq!(response.sessions[0].id, "abcdef01");
         assert_eq!(response.sessions[0].alive, 1);
+    }
+
+    #[test]
+    fn list_sessions_object_shape_treats_null_or_missing_text_fields_as_empty() {
+        let request = Request::ListSessions { x: Some(1) };
+        let value = json!([
+            {
+                "timestamp": 1716920000,
+                "mru": 1716921111,
+                "user_agent": null,
+                "ip": null,
+                "country": null,
+                "current": 1,
+                "id": "abcdef01",
+                "alive": 1
+            },
+            {
+                "timestamp": 1716920000,
+                "mru": 1716921111,
+                "current": 0,
+                "id": "abcdef02",
+                "alive": 0
+            }
+        ]);
+
+        let Response::ListSessions(response) = request.parse_response_data(value).unwrap() else {
+            panic!("expected list sessions response");
+        };
+
+        assert_eq!(response.sessions.len(), 2);
+        assert_eq!(response.sessions[0].user_agent, "");
+        assert_eq!(response.sessions[0].ip, "");
+        assert_eq!(response.sessions[0].country, "");
+        assert_eq!(response.sessions[1].user_agent, "");
+        assert_eq!(response.sessions[1].ip, "");
+        assert_eq!(response.sessions[1].country, "");
+        assert_eq!(response.sessions[1].id, "abcdef02");
+        assert_eq!(response.sessions[1].alive, 0);
     }
 
     #[test]
