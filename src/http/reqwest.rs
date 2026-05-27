@@ -13,20 +13,20 @@ use tokio_util::compat::FuturesAsyncReadCompatExt;
 use url::Url;
 
 use crate::error::{Error, Result};
-use crate::http::HttpClient;
+use crate::http::{HttpClient, HttpGetStream};
 use crate::protocol::commands::{Request, Response};
 use crate::{ClientState, ErrorCode};
 
 #[async_trait]
 impl HttpClient for reqwest::Client {
-    #[tracing::instrument(skip(self, state, query_params))]
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn send_requests(
         &self,
         state: &ClientState,
         requests: &[Request],
         query_params: &[(&str, &str)],
     ) -> Result<Vec<Response>> {
-        tracing::trace!(?self, ?state, "preparing MEGA request");
+        tracing::trace!("preparing MEGA request");
 
         let url = {
             let mut url = state.origin.join("/cs")?;
@@ -130,7 +130,7 @@ impl HttpClient for reqwest::Client {
         Err(Error::MaxRetriesReached)
     }
 
-    async fn get(&self, url: Url) -> Result<Pin<Box<dyn AsyncRead + Send>>> {
+    async fn get(&self, url: Url) -> Result<HttpGetStream> {
         let stream = self
             .get(url)
             .send()
@@ -139,7 +139,19 @@ impl HttpClient for reqwest::Client {
             .bytes_stream()
             .map_err(|err| io::Error::new(io::ErrorKind::Other, err));
 
-        Ok(Box::pin(stream.into_async_read()))
+        Ok(Box::pin(stream))
+    }
+
+    async fn get_str(&self, url: &str) -> Result<HttpGetStream> {
+        let stream = self
+            .get(url)
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes_stream()
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err));
+
+        Ok(Box::pin(stream))
     }
 
     async fn post(

@@ -56,12 +56,27 @@ pub enum Error {
     /// Failed condensed MAC verification.
     #[error("condensed MAC mismatch")]
     CondensedMacMismatch,
+    /// Missing AES IV for a file node.
+    #[error("missing AES IV for file node")]
+    MissingNodeAesIv,
+    /// Missing condensed MAC for a file node.
+    #[error("missing condensed MAC for file node")]
+    MissingCondensedMac,
+    /// Requested too many parallel download workers.
+    #[error("requested parallel download worker count exceeds the maximum allowed")]
+    ParallelismTooHigh,
+    /// Node is not a file (e.g., attempting to download a folder).
+    #[error("node is not a file")]
+    NotAFileNode,
     /// Failed to find node.
     #[error("failed to find node")]
     NodeNotFound,
     /// Failed to find node attribute.
     #[error("failed to find node attribute")]
     NodeAttributeNotFound,
+    /// Decrypted node attributes did not have the expected MEGA prefix.
+    #[error("invalid node attributes header")]
+    InvalidNodeAttributesHeader,
     /// Could not get a meaningful response after maximum retries.
     #[error("could not get a meaningful response after maximum retries")]
     MaxRetriesReached,

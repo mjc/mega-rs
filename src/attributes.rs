@@ -27,12 +27,18 @@ pub(crate) struct NodeAttributes {
 
 impl NodeAttributes {
     pub(crate) fn decrypt_and_unpack(file_key: &[u8; 16], buffer: &mut [u8]) -> Result<Self> {
+        if buffer.len() % 16 != 0 {
+            return Err(crate::Error::InvalidNodeAttributesHeader);
+        }
+
         let mut cbc = cbc::Decryptor::<Aes128>::new(file_key.into(), &<_>::default());
         for chunk in buffer.chunks_exact_mut(16) {
             cbc.decrypt_block_mut(chunk.into());
         }
 
-        assert_eq!(&buffer[..4], b"MEGA");
+        if buffer.len() < 4 || &buffer[..4] != b"MEGA" {
+            return Err(crate::Error::InvalidNodeAttributesHeader);
+        }
 
         let len = buffer.iter().take_while(|it| **it != b'\0').count();
         let attrs = json::from_slice(&buffer[4..len])?;

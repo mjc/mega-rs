@@ -70,6 +70,18 @@ Examples
 
 You can see examples of how to use this library by looking at [**the different examples available**](https://github.com/Hirevo/mega-rs/tree/main/examples).
 
+TLS backend selection
+---------------------
+
+- The default feature set enables the `rustls-tls` feature, so reqwest uses the Rustls TLS stack.
+- To build with native TLS instead, disable the defaults and enable `native-tls` so `reqwest/default-tls` kicks in. For example:
+
+  ```bash
+  cargo build --no-default-features --features "native-tls"
+  ```
+
+  With `--no-default-features`, enable any additional crate features you need explicitly. For example, use `--features "native-tls,parallel"` to build with native TLS and parallel downloads. `reqwest` remains a transitive dependency of the TLS backend features.
+
 License
 -------
 

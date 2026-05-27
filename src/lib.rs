@@ -1,7 +1,7 @@
 //! This is an API client library for interacting with MEGA's API using Rust.
 
 use std::collections::HashMap;
-use std::sync::atomic::AtomicU64;
+use std::sync::{atomic::AtomicU64, Arc};
 use std::time::Duration;
 
 use aes::Aes128;
@@ -9,7 +9,8 @@ use base64::prelude::{Engine, BASE64_URL_SAFE_NO_PAD};
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use cipher::generic_array::GenericArray;
 use cipher::{BlockDecryptMut, BlockEncrypt, BlockEncryptMut, KeyInit, KeyIvInit, StreamCipher};
-use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, Cursor};
+use futures::TryStreamExt;
 use hmac::{Hmac, Mac};
 use pbkdf2::pbkdf2_hmac_array;
 use secrecy::{ExposeSecret, SecretBox};
@@ -21,12 +22,23 @@ mod attributes;
 mod error;
 mod fingerprint;
 mod http;
+#[cfg(feature = "parallel")]
+mod parallel;
 mod protocol;
 mod sessions;
 mod utils;
 
 pub use crate::error::{Error, ErrorCode, Result};
-pub use crate::fingerprint::{compute_condensed_mac, compute_sparse_checksum};
+pub use crate::fingerprint::{
+    compute_condensed_mac, compute_condensed_mac_from_buffer, compute_sparse_checksum,
+};
+#[cfg(feature = "parallel")]
+pub use crate::fingerprint::{
+    compute_mega_chunk_mac, mega_chunk_boundaries, mega_chunk_boundaries_iter, MegaChunk,
+    MegaChunkBoundaries, MegaChunkMac, MegaCondensedMac, ParallelMacProcessor,
+};
+#[cfg(feature = "parallel")]
+pub use crate::parallel::{ParallelDownloadCallbacks, ParallelDownloadWriter};
 pub use crate::protocol::commands::{FileNode, NodeKind};
 pub use crate::sessions::SessionInfo;
 pub use crate::utils::StorageQuotas;
@@ -40,6 +52,18 @@ use crate::protocol::{FILE_KEY_SIZE, FOLDER_KEY_SIZE, USER_KEY_SIZE, USER_SID_SI
 use crate::utils::rsa::RsaPrivateKey;
 
 pub(crate) const DEFAULT_API_ORIGIN: &str = "https://g.api.mega.co.nz/";
+
+async fn collect_http_body(mut body: crate::http::HttpGetStream) -> Result<Vec<u8>> {
+    let mut buffer = Vec::new();
+    while let Some(chunk) = body.try_next().await? {
+        buffer.extend_from_slice(&chunk);
+    }
+    Ok(buffer)
+}
+
+async fn sleep_retry_delay(delay: Duration) {
+    futures_timer::Delay::new(delay).await;
+}
 
 /// A builder to initialize a [`Client`] instance.
 pub struct ClientBuilder {
@@ -396,6 +420,31 @@ impl Client {
         self.state.session.is_some()
     }
 
+    fn decode_optional_base64_string(value: Option<&str>) -> Result<Option<String>> {
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        let decoded = BASE64_URL_SAFE_NO_PAD.decode(value)?;
+        if decoded.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(String::from_utf8(decoded)?))
+    }
+
+    fn decode_optional_base64_u32(value: Option<&str>) -> Result<Option<u32>> {
+        let Some(value) = Self::decode_optional_base64_string(value)? else {
+            return Ok(None);
+        };
+        Ok(Some(value.parse::<u32>()?))
+    }
+
+    fn decode_optional_base64_i32(value: Option<&str>) -> Result<Option<i32>> {
+        let Some(value) = Self::decode_optional_base64_string(value)? else {
+            return Ok(None);
+        };
+        Ok(Some(value.parse::<i32>()?))
+    }
+
     /// Get information about the current user.
     pub async fn get_current_user_info(&self) -> Result<UserInfo> {
         let request = Request::UserInfo { v: None };
@@ -422,36 +471,19 @@ impl Client {
                 String::from_utf8(decoded)?
             },
             email: response.email.clone(),
-            country_code: 'result: {
-                let Some(country) = &response.country else {
-                    break 'result None;
-                };
-                let decoded = BASE64_URL_SAFE_NO_PAD.decode(&country)?;
-                let country = String::from_utf8(decoded)?;
-                Some(country)
-            },
+            country_code: Self::decode_optional_base64_string(response.country.as_deref())?,
             birth_date: 'result: {
-                let Some(day) = &response.birthday else {
+                let Some(day) = Self::decode_optional_base64_u32(response.birthday.as_deref())?
+                else {
                     break 'result None;
                 };
-                let Some(month) = &response.birthmonth else {
+                let Some(month) = Self::decode_optional_base64_u32(response.birthmonth.as_deref())?
+                else {
                     break 'result None;
                 };
-                let Some(year) = &response.birthyear else {
+                let Some(year) = Self::decode_optional_base64_i32(response.birthyear.as_deref())?
+                else {
                     break 'result None;
-                };
-
-                let day: u32 = {
-                    let decoded = BASE64_URL_SAFE_NO_PAD.decode(&day)?;
-                    String::from_utf8(decoded)?.parse::<u32>()?
-                };
-                let month: u32 = {
-                    let decoded = BASE64_URL_SAFE_NO_PAD.decode(&month)?;
-                    String::from_utf8(decoded)?.parse::<u32>()?
-                };
-                let year: i32 = {
-                    let decoded = BASE64_URL_SAFE_NO_PAD.decode(&year)?;
-                    String::from_utf8(decoded)?.parse::<i32>()?
                 };
 
                 NaiveDate::from_ymd_opt(year, month, day)
@@ -786,9 +818,9 @@ impl Client {
     /// - https://mega.nz/folder/{node_id}#{node_key}
     #[allow(rustdoc::bare_urls)]
     pub async fn fetch_public_nodes(&self, url: &str) -> Result<Nodes> {
-        let payload = match url.split_at(16) {
-            ("https://mega.nz/", payload) => payload,
-            _ => {
+        let payload = match url.strip_prefix("https://mega.nz/") {
+            Some(payload) => payload,
+            None => {
                 return Err(Error::InvalidPublicUrlFormat);
             }
         };
@@ -922,64 +954,15 @@ impl Client {
                                 continue;
                             };
 
-                            let Some(mut file_key) = file_key.split('/').find_map(|key| {
-                                let (_, file_key) = key.split_once(':')?;
-
-                                if file_key.len() >= 44 {
-                                    // Keys bigger than this size are using RSA instead of AES.
-                                    // We don't support this as of right now.
-                                    todo!();
-                                }
-
-                                let mut file_key = BASE64_URL_SAFE_NO_PAD.decode(file_key).ok()?;
-
-                                // File keys are 32 bytes and folder keys are 16 bytes.
-                                // Other sizes are considered invalid.
-                                if (file.kind.is_file() && file_key.len() != FILE_KEY_SIZE)
-                                    || (!file.kind.is_file() && file_key.len() != FOLDER_KEY_SIZE)
-                                {
-                                    return None;
-                                }
-
-                                // TODO: MEGA includes in its web client a check to see if both halves of `file_key`
-                                //       are identical to each other. This is apparently done to prevent an attacker from
-                                //       being able to produce an all-zeroes AES key (by XOR-ing the two halves after EBC decryption).
-                                //       It's a bit unclear what we should do in our specific case, so it isn't yet implemented here.
-                                //
-                                //       Here would be how to implement such a check:
-                                //       ```
-                                //       if !self.state.allow_null_keys {
-                                //           let (fst, snd) = file_key.split_at(16);
-                                //           if fst == snd {
-                                //               return None;
-                                //           }
-                                //       }
-                                //       ```
-
-                                utils::decrypt_ebc_in_place(&node_key, &mut file_key);
-                                Some(file_key)
-                            }) else {
+                            let Some((_file_key, aes_key, aes_iv, condensed_mac, attrs)) =
+                                file_key.split('/').find_map(|key| {
+                                    let (_, file_key) = key.split_once(':')?;
+                                    decode_public_node_with_attrs(
+                                        file.kind, file_key, &file.attr, &node_key,
+                                    )
+                                })
+                            else {
                                 continue;
-                            };
-
-                            let (aes_key, aes_iv, condensed_mac) = if file.kind.is_file() {
-                                utils::unmerge_key_mac(&mut file_key);
-
-                                let (aes_key, rest) = file_key.split_at(16);
-                                let (aes_iv, condensed_mac) = rest.split_at(8);
-
-                                (
-                                    aes_key.try_into().unwrap(),
-                                    aes_iv.try_into().ok(),
-                                    condensed_mac.try_into().ok(),
-                                )
-                            } else {
-                                (file_key.try_into().unwrap(), None, None)
-                            };
-
-                            let attrs = {
-                                let mut buffer = BASE64_URL_SAFE_NO_PAD.decode(&file.attr)?;
-                                NodeAttributes::decrypt_and_unpack(&aes_key, buffer.as_mut_slice())?
                             };
 
                             let (thumbnail_handle, preview_image_handle) = file
@@ -1130,8 +1113,8 @@ impl Client {
         })
     }
 
-    /// Downloads a file into the given writer.
-    pub async fn download_node<W: AsyncWrite>(&self, node: &Node, writer: W) -> Result<()> {
+    /// Fetches the download URL and server-reported size for a node from MEGA's servers.
+    async fn get_download_url(&self, node: &Node) -> Result<(String, u64)> {
         let responses = if let Some(download_id) = node.download_id() {
             let request = if node.handle.as_str() == download_id {
                 Request::Download {
@@ -1163,69 +1146,132 @@ impl Client {
             self.send_requests(&[request]).await?
         };
 
-        let response = match responses.as_slice() {
-            [Response::Download(response)] => response,
-            [Response::Error(code)] => {
-                return Err(Error::from(*code));
-            }
-            _ => {
-                return Err(Error::InvalidResponseType);
-            }
-        };
+        match responses.as_slice() {
+            [Response::Download(response)] => Ok((response.download_url.clone(), response.size)),
+            [Response::Error(code)] => Err(Error::from(*code)),
+            _ => Err(Error::InvalidResponseType),
+        }
+    }
 
-        let url =
-            Url::parse(format!("{0}/{1}-{2}", response.download_url, 0, response.size).as_str())?;
+    /// Downloads a file into the given writer using a single connection.
+    ///
+    /// This is the simplest download method, suitable for smaller files or when
+    /// a single connection is preferred. For better performance on large files,
+    /// consider enabling the `parallel` feature and using `download_node_parallel`.
+    ///
+    /// # Arguments
+    /// * `node` - The node to download
+    /// * `writer` - An async writer to write the decrypted file contents to
+    pub async fn download_node<W: AsyncWrite>(&self, node: &Node, writer: W) -> Result<()> {
+        self.download_node_with_progress(node, writer, None).await
+    }
 
-        let mut reader = self.client.get(url).await?.take(node.size);
+    /// Downloads a file with optional progress tracking via a single connection.
+    ///
+    /// Provides the same functionality as [`download_node`](Self::download_node)
+    /// but allows monitoring download progress via a callback. For faster downloads
+    /// on large files (when the `parallel` feature is enabled), use
+    /// `download_node_parallel`.
+    ///
+    /// # Arguments
+    /// * `node` - The node to download
+    /// * `writer` - An async writer to write the decrypted file contents to
+    /// * `progress` - Optional `Arc<dyn Fn(u64) + Send + Sync>` callback invoked with cumulative bytes downloaded so far
+    pub async fn download_node_with_progress<W: AsyncWrite>(
+        &self,
+        node: &Node,
+        writer: W,
+        progress: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+    ) -> Result<()> {
+        if !node.kind.is_file() {
+            return Err(Error::NotAFileNode);
+        }
+
+        let aes_iv = node.aes_iv.ok_or(Error::MissingNodeAesIv)?;
+        let expected_mac = node.condensed_mac.ok_or(Error::MissingCondensedMac)?;
+
+        let (base_url, server_size) = self.get_download_url(node).await?;
+        let size = server_size;
+        // Use inclusive end range (MEGA API expects end byte inclusive), or early return for empty files
+        if size == 0 {
+            if let Some(cb) = progress {
+                cb(0);
+            }
+            let empty_mac = fingerprint::compute_condensed_mac(
+                Cursor::new(Vec::new()),
+                0,
+                &node.aes_key,
+                &aes_iv,
+            )
+            .await?;
+            if empty_mac != expected_mac {
+                return Err(Error::CondensedMacMismatch);
+            }
+            return Ok(());
+        }
+        let url = Url::parse(&format!("{base_url}/0-{}", size - 1))?;
+
+        let mut body = self.client.get(url).await?;
 
         let mut file_iv = [0u8; 16];
 
-        file_iv[..8].copy_from_slice(node.aes_iv.unwrap_or_default().as_slice());
+        file_iv[..8].copy_from_slice(&aes_iv);
         let mut ctr = ctr::Ctr128BE::<Aes128>::new(node.aes_key[..].into(), (&file_iv).into());
-
-        file_iv[8..].copy_from_slice(node.aes_iv.unwrap_or_default().as_slice());
 
         let (condensed_mac_reader, condensed_mac_writer) = sluice::pipe::pipe();
 
+        // Progress tracking
         let download_future = async move {
-            let mut chunk_size: u64 = 131_072; // 2^17
-
-            let mut buffer = {
-                let chunk_size = usize::try_from(chunk_size).unwrap();
-                Vec::with_capacity(chunk_size)
-            };
+            let mut total_written = 0u64;
 
             futures::pin_mut!(writer);
             futures::pin_mut!(condensed_mac_writer);
 
-            loop {
-                buffer.clear();
-
-                let bytes_read = (&mut reader)
-                    .take(chunk_size)
-                    .read_to_end(&mut buffer)
-                    .await?;
-
-                if bytes_read == 0 {
-                    break;
+            while let Some(chunk) = body.try_next().await? {
+                let next_total =
+                    total_written
+                        .checked_add(chunk.len() as u64)
+                        .ok_or_else(|| {
+                            Error::from(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "download body length overflowed u64",
+                            ))
+                        })?;
+                if next_total > size {
+                    return Err(Error::from(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "download body exceeded expected length: expected {size} bytes, got at least {next_total} bytes"
+                        ),
+                    )));
                 }
 
+                let mut buffer = chunk.to_vec();
                 ctr.apply_keystream(&mut buffer);
                 writer.write_all(&buffer).await?;
                 condensed_mac_writer.write_all(&buffer).await?;
 
-                if chunk_size < 1_048_576 {
-                    chunk_size += 131_072;
+                total_written = next_total;
+                if let Some(ref cb) = progress {
+                    cb(total_written);
                 }
+            }
+
+            if total_written != size {
+                return Err(Error::from(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "unexpected EOF while reading download body: expected {size} bytes, got {total_written} bytes"
+                    ),
+                )));
             }
 
             Ok(())
         };
 
         let condensed_mac_future = {
-            let size = node.size;
             let aes_key = node.aes_key;
-            let aes_iv = node.aes_iv.unwrap();
+            let aes_iv = aes_iv;
             async move {
                 fingerprint::compute_condensed_mac(condensed_mac_reader, size, &aes_key, &aes_iv)
                     .await
@@ -1234,11 +1280,298 @@ impl Client {
 
         let (_, condensed_mac) = futures::try_join!(download_future, condensed_mac_future)?;
 
-        if condensed_mac != node.condensed_mac.unwrap_or_default() {
+        if condensed_mac != expected_mac {
             return Err(Error::CondensedMacMismatch);
         }
 
         Ok(())
+    }
+
+    /// Downloads a file using multiple parallel connections for improved speed.
+    ///
+    /// This method is optimized for larger files where bandwidth efficiency matters.
+    /// It downloads file chunks in parallel while maintaining the integrity of the file
+    /// through concurrent MAC verification, with peak memory roughly twice the
+    /// number of workers times the largest MEGA MAC chunk size.
+    ///
+    /// **Architecture:**
+    /// - Multiple download workers fetch MEGA MAC chunks concurrently from the server
+    /// - Downloaded chunks are buffered in-flight but immediately decrypted and written as available
+    /// - A single processor task handles decryption, file writing, and MAC computation
+    /// - MAC verification uses concurrent data structures to store only 16-byte MACs per MEGA chunk
+    /// - Out-of-order chunks are handled transparently; final integrity check uses condensed MAC
+    ///
+    /// # Arguments
+    /// * `node` - The node to download
+    /// * `writer` - An async writer that supports seeking (e.g., any `tokio::io::AsyncWrite + AsyncSeek`)
+    /// * `num_connections` - Number of parallel download workers (recommended: 4-8 for optimal throughput)
+    ///
+    /// # Errors
+    /// * [`Error::ParallelismTooHigh`] if you request more than 16 workers (to keep memory bounded).
+    #[cfg(feature = "parallel")]
+    pub async fn download_node_parallel<W>(
+        &self,
+        node: &Node,
+        writer: W,
+        num_connections: usize,
+    ) -> Result<()>
+    where
+        W: tokio::io::AsyncWrite + tokio::io::AsyncSeek + Unpin + Send + 'static,
+    {
+        self.download_node_parallel_with_progress::<W, fn(u64)>(node, writer, num_connections, None)
+            .await
+    }
+
+    /// Downloads a file using multiple parallel connections with progress tracking.
+    ///
+    /// Same as `download_node_parallel` but with
+    /// an optional progress callback.
+    ///
+    /// # Arguments
+    /// * `node` - The node to download
+    /// * `writer` - An async writer that supports seeking (e.g., any `tokio::io::AsyncWrite + AsyncSeek`)
+    /// * `num_connections` - Number of parallel download workers (recommended: 4-8 for optimal throughput)
+    /// * `progress` - Optional callback invoked with the cumulative number of bytes downloaded so far
+    ///   (reports are monotonically increasing and may skip values due to concurrent worker ordering)
+    #[cfg(feature = "parallel")]
+    pub async fn download_node_parallel_with_progress<W, F>(
+        &self,
+        node: &Node,
+        writer: W,
+        num_connections: usize,
+        progress: Option<F>,
+    ) -> Result<()>
+    where
+        W: tokio::io::AsyncWrite + tokio::io::AsyncSeek + Unpin + Send + 'static,
+        F: Fn(u64) + Send + Sync + 'static,
+    {
+        if !node.kind.is_file() {
+            return Err(Error::NotAFileNode);
+        }
+
+        let aes_iv = node.aes_iv.ok_or(Error::MissingNodeAesIv)?;
+        let expected_mac = node.condensed_mac.ok_or(Error::MissingCondensedMac)?;
+
+        let (base_url, server_size) = self.get_download_url(node).await?;
+        let progress = progress.map(|cb| Arc::new(cb) as Arc<dyn Fn(u64) + Send + Sync>);
+        parallel::download_parallel(
+            &*self.client,
+            node,
+            base_url,
+            server_size,
+            writer,
+            num_connections,
+            None,
+            progress,
+            aes_iv,
+            expected_mac,
+        )
+        .await
+    }
+
+    #[cfg(feature = "parallel")]
+    pub async fn download_node_parallel_to_file_with_progress<F>(
+        &self,
+        node: &Node,
+        writer: tokio::fs::File,
+        num_connections: usize,
+        progress: Option<F>,
+    ) -> Result<()>
+    where
+        F: Fn(u64) + Send + Sync + 'static,
+    {
+        if !node.kind.is_file() {
+            return Err(Error::NotAFileNode);
+        }
+
+        let aes_iv = node.aes_iv.ok_or(Error::MissingNodeAesIv)?;
+        let expected_mac = node.condensed_mac.ok_or(Error::MissingCondensedMac)?;
+
+        let (base_url, server_size) = self.get_download_url(node).await?;
+        let progress = progress.map(|cb| Arc::new(cb) as Arc<dyn Fn(u64) + Send + Sync>);
+        parallel::download_parallel_resumable_to_file(
+            &*self.client,
+            node,
+            base_url,
+            server_size,
+            writer,
+            num_connections,
+            None,
+            progress,
+            None,
+            None,
+            aes_iv,
+            expected_mac,
+        )
+        .await
+    }
+
+    /// Downloads a file using multiple parallel connections, skipping
+    /// prevalidated plaintext MEGA chunks.
+    ///
+    /// `trusted_chunks` is a dense chunk-indexed slice. Entries set to `Some`
+    /// contain the already verified plaintext chunk MAC and are not fetched or
+    /// written. Missing entries are downloaded, decrypted in memory, written as
+    /// plaintext, and reported through `chunk_verified` only after the chunk
+    /// has been written, flushed, and durably synced through the writer.
+    #[cfg(feature = "parallel")]
+    pub async fn download_node_parallel_resumable_with_progress<W, F, C>(
+        &self,
+        node: &Node,
+        writer: W,
+        num_connections: usize,
+        max_chunks_per_request: Option<usize>,
+        trusted_chunks: &[Option<[u8; 16]>],
+        progress: Option<F>,
+        chunk_verified: Option<C>,
+    ) -> Result<()>
+    where
+        W: ParallelDownloadWriter + 'static,
+        F: Fn(u64) + Send + Sync + 'static,
+        C: Fn(u32, [u8; 16]) + Send + Sync + 'static,
+    {
+        if !node.kind.is_file() {
+            return Err(Error::NotAFileNode);
+        }
+
+        let aes_iv = node.aes_iv.ok_or(Error::MissingNodeAesIv)?;
+        let expected_mac = node.condensed_mac.ok_or(Error::MissingCondensedMac)?;
+
+        let (base_url, server_size) = self.get_download_url(node).await?;
+        let progress = progress.map(|cb| Arc::new(cb) as Arc<dyn Fn(u64) + Send + Sync>);
+        let trusted_chunks: Arc<[Option<[u8; 16]>]> = trusted_chunks.to_vec().into();
+        let chunk_verified =
+            chunk_verified.map(|cb| Arc::new(cb) as Arc<dyn Fn(u32, [u8; 16]) + Send + Sync>);
+        parallel::download_parallel_resumable(
+            &*self.client,
+            node,
+            base_url,
+            server_size,
+            writer,
+            num_connections,
+            max_chunks_per_request,
+            progress,
+            Some(trusted_chunks),
+            chunk_verified,
+            aes_iv,
+            expected_mac,
+        )
+        .await
+    }
+
+    #[cfg(feature = "parallel")]
+    pub async fn download_node_parallel_resumable_with_callbacks<W>(
+        &self,
+        node: &Node,
+        writer: W,
+        num_connections: usize,
+        max_chunks_per_request: Option<usize>,
+        trusted_chunks: Arc<[Option<[u8; 16]>]>,
+        callbacks: Option<Arc<dyn ParallelDownloadCallbacks>>,
+    ) -> Result<()>
+    where
+        W: ParallelDownloadWriter + 'static,
+    {
+        if !node.kind.is_file() {
+            return Err(Error::NotAFileNode);
+        }
+
+        let aes_iv = node.aes_iv.ok_or(Error::MissingNodeAesIv)?;
+        let expected_mac = node.condensed_mac.ok_or(Error::MissingCondensedMac)?;
+
+        let (base_url, server_size) = self.get_download_url(node).await?;
+        parallel::download_parallel_resumable_with_callbacks(
+            &*self.client,
+            node,
+            base_url,
+            server_size,
+            writer,
+            num_connections,
+            max_chunks_per_request,
+            Some(trusted_chunks),
+            callbacks,
+            aes_iv,
+            expected_mac,
+        )
+        .await
+    }
+
+    #[cfg(feature = "parallel")]
+    pub async fn download_node_parallel_resumable_to_file_with_progress<F, C>(
+        &self,
+        node: &Node,
+        writer: tokio::fs::File,
+        num_connections: usize,
+        max_chunks_per_request: Option<usize>,
+        trusted_chunks: &[Option<[u8; 16]>],
+        progress: Option<F>,
+        chunk_verified: Option<C>,
+    ) -> Result<()>
+    where
+        F: Fn(u64) + Send + Sync + 'static,
+        C: Fn(u32, [u8; 16]) + Send + Sync + 'static,
+    {
+        if !node.kind.is_file() {
+            return Err(Error::NotAFileNode);
+        }
+
+        let aes_iv = node.aes_iv.ok_or(Error::MissingNodeAesIv)?;
+        let expected_mac = node.condensed_mac.ok_or(Error::MissingCondensedMac)?;
+
+        let (base_url, server_size) = self.get_download_url(node).await?;
+        let progress = progress.map(|cb| Arc::new(cb) as Arc<dyn Fn(u64) + Send + Sync>);
+        let trusted_chunks: Arc<[Option<[u8; 16]>]> = trusted_chunks.to_vec().into();
+        let chunk_verified =
+            chunk_verified.map(|cb| Arc::new(cb) as Arc<dyn Fn(u32, [u8; 16]) + Send + Sync>);
+        parallel::download_parallel_resumable_to_file(
+            &*self.client,
+            node,
+            base_url,
+            server_size,
+            writer,
+            num_connections,
+            max_chunks_per_request,
+            progress,
+            Some(trusted_chunks),
+            chunk_verified,
+            aes_iv,
+            expected_mac,
+        )
+        .await
+    }
+
+    #[cfg(feature = "parallel")]
+    pub async fn download_node_parallel_resumable_to_file_with_callbacks(
+        &self,
+        node: &Node,
+        writer: tokio::fs::File,
+        num_connections: usize,
+        max_chunks_per_request: Option<usize>,
+        trusted_chunks: Arc<[Option<[u8; 16]>]>,
+        callbacks: Option<Arc<dyn ParallelDownloadCallbacks>>,
+    ) -> Result<()> {
+        if !node.kind.is_file() {
+            return Err(Error::NotAFileNode);
+        }
+
+        let aes_iv = node.aes_iv.ok_or(Error::MissingNodeAesIv)?;
+        let expected_mac = node.condensed_mac.ok_or(Error::MissingCondensedMac)?;
+
+        let (base_url, server_size) = self.get_download_url(node).await?;
+        parallel::download_parallel_resumable_to_file_with_callbacks(
+            &*self.client,
+            node,
+            base_url,
+            server_size,
+            writer,
+            num_connections,
+            max_chunks_per_request,
+            Some(trusted_chunks),
+            callbacks,
+            aes_iv,
+            expected_mac,
+        )
+        .await
     }
 
     /// Uploads a file within a parent folder.
@@ -1788,7 +2121,7 @@ impl Client {
         let mut delay = self.state.min_retry_delay;
         for i in 0..self.state.max_retries {
             if i > 0 {
-                tokio::time::sleep(delay).await;
+                sleep_retry_delay(delay).await;
                 delay *= 2;
                 // TODO: maybe add some small random jitter after the doubling.
                 if delay > self.state.max_retry_delay {
@@ -1796,10 +2129,7 @@ impl Client {
                 }
             }
 
-            let mut response = self.client.get(url.clone()).await?;
-
-            let mut buffer = Vec::default();
-            response.read_to_end(&mut buffer).await?;
+            let buffer = collect_http_body(self.client.get(url.clone()).await?).await?;
 
             let value: json::Value = json::from_slice(&buffer)?;
             if value.is_number() {
@@ -1910,7 +2240,7 @@ impl Client {
             match response {
                 EventBatchResponse::Wait(response) => {
                     let wait_url = Url::parse(&response.wait_url)?;
-                    self.client.get(wait_url).await?;
+                    let _ = self.client.get(wait_url).await?;
                 }
                 EventBatchResponse::Ready(response) => {
                     break response;
@@ -1982,6 +2312,58 @@ impl Client {
             response.sn,
         ))
     }
+}
+
+fn unpack_node_key(
+    node_kind: NodeKind,
+    mut file_key: Vec<u8>,
+) -> Option<(Vec<u8>, [u8; 16], Option<[u8; 8]>, Option<[u8; 8]>)> {
+    if (node_kind.is_file() && file_key.len() != FILE_KEY_SIZE)
+        || (!node_kind.is_file() && file_key.len() != FOLDER_KEY_SIZE)
+    {
+        return None;
+    }
+
+    if node_kind.is_file() {
+        utils::unmerge_key_mac(&mut file_key);
+
+        let (aes_key, rest) = file_key.split_at(16);
+        let (aes_iv, condensed_mac) = rest.split_at(8);
+        let aes_key: [u8; 16] = aes_key.try_into().unwrap();
+        let aes_iv: [u8; 8] = aes_iv.try_into().unwrap();
+        let condensed_mac: [u8; 8] = condensed_mac.try_into().unwrap();
+
+        Some((file_key, aes_key, Some(aes_iv), Some(condensed_mac)))
+    } else {
+        Some((file_key.clone(), file_key.try_into().unwrap(), None, None))
+    }
+}
+
+fn decode_public_node_with_attrs(
+    node_kind: NodeKind,
+    encrypted_key: &str,
+    encrypted_attr: &str,
+    folder_key: &[u8],
+) -> Option<(
+    Vec<u8>,
+    [u8; 16],
+    Option<[u8; 8]>,
+    Option<[u8; 8]>,
+    NodeAttributes,
+)> {
+    if encrypted_key.len() >= 44 {
+        return None;
+    }
+
+    let mut file_key = BASE64_URL_SAFE_NO_PAD.decode(encrypted_key).ok()?;
+    utils::decrypt_ebc_in_place(folder_key, &mut file_key);
+
+    let (file_key, aes_key, aes_iv, condensed_mac) = unpack_node_key(node_kind, file_key)?;
+
+    let mut buffer = BASE64_URL_SAFE_NO_PAD.decode(encrypted_attr).ok()?;
+    let attrs = NodeAttributes::decrypt_and_unpack(&aes_key, buffer.as_mut_slice()).ok()?;
+
+    Some((file_key, aes_key, aes_iv, condensed_mac, attrs))
 }
 
 fn construct_event_node(
@@ -2376,7 +2758,7 @@ impl EventBatch {
 }
 
 /// Represents a node stored in MEGA (either a file or a folder).
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Node {
     /// The name of the node.
     pub(crate) name: String,
@@ -2495,6 +2877,7 @@ impl Node {
 }
 
 /// Represents a collection of nodes from MEGA.
+#[derive(Debug, Clone)]
 pub struct Nodes {
     /// The nodes from MEGA, keyed by their handle.
     pub(crate) nodes: HashMap<String, Node>,
@@ -2777,4 +3160,74 @@ pub struct UserInfo {
     pub birth_date: Option<NaiveDate>,
     /// The country code of the user.
     pub country_code: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn public_folder_key_selection_uses_fragment_that_decrypts_attrs() {
+        fn encrypt_ebc(key: &[u8; 16], data: &mut [u8]) {
+            let mut aes = Aes128::new(key.into());
+            for block in data.chunks_mut(16) {
+                aes.encrypt_block_mut(block.into());
+            }
+        }
+
+        let folder_key = [0x11; 16];
+        let good_plain_key = [0x22; 16];
+        let bad_plain_key = [0x33; 16];
+        let attrs = NodeAttributes {
+            name: "ok".to_string(),
+            fingerprint: None,
+            modified_at: None,
+            other: HashMap::new(),
+        };
+        let encrypted_attr =
+            BASE64_URL_SAFE_NO_PAD.encode(attrs.pack_and_encrypt(&good_plain_key).unwrap());
+
+        let mut good_key = good_plain_key.to_vec();
+        encrypt_ebc(&folder_key, &mut good_key);
+        let good_key = BASE64_URL_SAFE_NO_PAD.encode(good_key);
+
+        let mut bad_key = bad_plain_key.to_vec();
+        encrypt_ebc(&folder_key, &mut bad_key);
+        let bad_key = BASE64_URL_SAFE_NO_PAD.encode(bad_key);
+
+        assert!(
+            decode_public_node_with_attrs(
+                NodeKind::Folder,
+                &bad_key,
+                &encrypted_attr,
+                &folder_key,
+            )
+            .is_none(),
+            "wrong fragment should be rejected instead of poisoning the whole folder fetch",
+        );
+
+        let (_, _, _, _, decoded_attrs) = decode_public_node_with_attrs(
+            NodeKind::Folder,
+            &good_key,
+            &encrypted_attr,
+            &folder_key,
+        )
+        .expect("correct fragment should decrypt attrs");
+        assert_eq!(decoded_attrs.name, "ok");
+    }
+
+    #[test]
+    fn optional_base64_birth_fields_treat_empty_payload_as_missing() {
+        assert_eq!(Client::decode_optional_base64_u32(Some("")).unwrap(), None);
+        assert_eq!(
+            Client::decode_optional_base64_u32(Some(&BASE64_URL_SAFE_NO_PAD.encode("12"))).unwrap(),
+            Some(12)
+        );
+        assert_eq!(Client::decode_optional_base64_i32(Some("")).unwrap(), None);
+        assert_eq!(
+            Client::decode_optional_base64_i32(Some(&BASE64_URL_SAFE_NO_PAD.encode("2024")))
+                .unwrap(),
+            Some(2024)
+        );
+    }
 }
