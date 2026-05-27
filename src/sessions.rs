@@ -52,3 +52,62 @@ impl From<&commands::SessionInfo> for SessionInfo {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_protocol_session() -> commands::SessionInfo {
+        commands::SessionInfo {
+            timestamp: 1_716_920_000,
+            mru: 1_716_921_111,
+            user_agent: String::from("Firefox"),
+            ip: String::from("203.0.113.4"),
+            country: String::from("US"),
+            current: 1,
+            id: String::from("abcdef01"),
+            alive: 1,
+        }
+    }
+
+    #[test]
+    fn owned_protocol_session_maps_to_public_session_info() {
+        let session = SessionInfo::from(sample_protocol_session());
+
+        assert_eq!(session.id, "abcdef01");
+        assert_eq!(
+            session.created_at,
+            Utc.timestamp_opt(1_716_920_000, 0).unwrap()
+        );
+        assert_eq!(
+            session.last_activity_at,
+            Utc.timestamp_opt(1_716_921_111, 0).unwrap()
+        );
+        assert_eq!(session.user_agent, "Firefox");
+        assert_eq!(session.ip, "203.0.113.4");
+        assert_eq!(session.country_code, "US");
+        assert!(session.current);
+        assert!(session.alive);
+    }
+
+    #[test]
+    fn borrowed_protocol_session_maps_to_public_session_info() {
+        let protocol = sample_protocol_session();
+        let session = SessionInfo::from(&protocol);
+
+        assert_eq!(session.id, "abcdef01");
+        assert_eq!(
+            session.created_at,
+            Utc.timestamp_opt(1_716_920_000, 0).unwrap()
+        );
+        assert_eq!(
+            session.last_activity_at,
+            Utc.timestamp_opt(1_716_921_111, 0).unwrap()
+        );
+        assert_eq!(session.user_agent, "Firefox");
+        assert_eq!(session.ip, "203.0.113.4");
+        assert_eq!(session.country_code, "US");
+        assert!(session.current);
+        assert!(session.alive);
+    }
+}

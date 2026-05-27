@@ -879,6 +879,78 @@ mod tests {
     use super::*;
     use json::json;
 
+    // These regressions mirror the MEGA SDK's ug parser and attribute handling:
+    // - https://github.com/meganz/sdk/blob/d41138b3b6acce78353434af30e582d38bba6a73/src/commands.cpp#L4393-L4404
+    // - https://github.com/meganz/sdk/blob/d41138b3b6acce78353434af30e582d38bba6a73/src/commands.cpp#L4584-L4597
+    // - https://github.com/meganz/sdk/blob/d41138b3b6acce78353434af30e582d38bba6a73/src/commands.cpp#L5576-L5585
+    //
+    // These regressions mirror the MEGA SDK's usl parser, which reads session rows as
+    // positional arrays and tolerates missing textual values while still consuming the
+    // extra id/alive/device-id fields:
+    // - https://github.com/meganz/sdk/blob/d41138b3b6acce78353434af30e582d38bba6a73/src/commands.cpp#L6503-L6521
+
+    #[test]
+    fn user_info_response_defaults_missing_name_fields() {
+        let request = Request::UserInfo { v: None };
+        let value = json!({
+            "u": "user-handle",
+            "s": 0,
+            "email": "user@example.com",
+            "country": null,
+            "birthday": null,
+            "birthmonth": null,
+            "birthyear": null,
+            "name": "",
+            "k": "",
+            "c": 0,
+            "pubk": "",
+            "privk": "",
+            "terms": null,
+            "ts": "0"
+        });
+
+        let Response::UserInfo(response) = request.parse_response_data(value).unwrap() else {
+            panic!("expected user info response");
+        };
+
+        assert_eq!(response.firstname, "");
+        assert_eq!(response.lastname, "");
+        assert_eq!(response.country, None);
+        assert_eq!(response.birthday, None);
+    }
+
+    #[test]
+    fn user_info_response_preserves_optional_attr_payloads() {
+        let request = Request::UserInfo { v: None };
+        let value = json!({
+            "u": "user-handle",
+            "s": 0,
+            "email": "user@example.com",
+            "firstname": "SmFuZQ",
+            "lastname": "RG9l",
+            "country": "",
+            "birthday": "",
+            "birthmonth": "NQ",
+            "birthyear": "MjAyNg",
+            "name": "",
+            "k": "",
+            "c": 0,
+            "pubk": "",
+            "privk": "",
+            "terms": null,
+            "ts": "0"
+        });
+
+        let Response::UserInfo(response) = request.parse_response_data(value).unwrap() else {
+            panic!("expected user info response");
+        };
+
+        assert_eq!(response.country.as_deref(), Some(""));
+        assert_eq!(response.birthday.as_deref(), Some(""));
+        assert_eq!(response.birthmonth.as_deref(), Some("NQ"));
+        assert_eq!(response.birthyear.as_deref(), Some("MjAyNg"));
+    }
+
     #[test]
     fn list_sessions_response_accepts_megas_sequence_shape() {
         let request = Request::ListSessions { x: Some(1) };
@@ -927,5 +999,108 @@ mod tests {
         assert_eq!(response.sessions[0].country, "");
         assert_eq!(response.sessions[0].id, "abcdef01");
         assert_eq!(response.sessions[0].alive, 0);
+    }
+
+    #[test]
+    fn list_sessions_response_accepts_sequence_without_extended_fields() {
+        let request = Request::ListSessions { x: None };
+        let value = json!([[1716920000, 1716921111, "Firefox", "203.0.113.4", "US", 1]]);
+
+        let Response::ListSessions(response) = request.parse_response_data(value).unwrap() else {
+            panic!("expected list sessions response");
+        };
+
+        assert_eq!(response.sessions.len(), 1);
+        assert_eq!(response.sessions[0].id, "");
+        assert_eq!(response.sessions[0].alive, 0);
+        assert_eq!(response.sessions[0].current, 1);
+    }
+
+    #[test]
+    fn list_sessions_response_accepts_sequence_with_device_id_tail() {
+        let request = Request::ListSessions { x: Some(1) };
+        let value = json!([[
+            1716920000,
+            1716921111,
+            "Firefox",
+            "203.0.113.4",
+            "US",
+            1,
+            "abcdef01",
+            1,
+            "phone"
+        ]]);
+
+        let Response::ListSessions(response) = request.parse_response_data(value).unwrap() else {
+            panic!("expected list sessions response");
+        };
+
+        assert_eq!(response.sessions.len(), 1);
+        assert_eq!(response.sessions[0].id, "abcdef01");
+        assert_eq!(response.sessions[0].alive, 1);
+    }
+
+    #[test]
+    fn list_sessions_response_accepts_object_shape_fallback() {
+        let request = Request::ListSessions { x: Some(1) };
+        let value = json!([{
+            "timestamp": 1716920000,
+            "mru": 1716921111,
+            "user_agent": "Firefox",
+            "ip": "203.0.113.4",
+            "country": "US",
+            "current": 1,
+            "id": "abcdef01",
+            "alive": 1
+        }]);
+
+        let Response::ListSessions(response) = request.parse_response_data(value).unwrap() else {
+            panic!("expected list sessions response");
+        };
+
+        assert_eq!(response.sessions.len(), 1);
+        assert_eq!(response.sessions[0].user_agent, "Firefox");
+        assert_eq!(response.sessions[0].id, "abcdef01");
+        assert_eq!(response.sessions[0].alive, 1);
+    }
+
+    #[test]
+    fn list_sessions_response_rejects_invalid_sequence_lengths() {
+        let request = Request::ListSessions { x: Some(1) };
+
+        assert!(request
+            .parse_response_data(json!([[
+                1716920000,
+                1716921111,
+                "Firefox",
+                "203.0.113.4",
+                "US"
+            ]]))
+            .is_err());
+        assert!(request
+            .parse_response_data(json!([[
+                1716920000,
+                1716921111,
+                "Firefox",
+                "203.0.113.4",
+                "US",
+                1,
+                "abcdef01"
+            ]]))
+            .is_err());
+        assert!(request
+            .parse_response_data(json!([[
+                1716920000,
+                1716921111,
+                "Firefox",
+                "203.0.113.4",
+                "US",
+                1,
+                "abcdef01",
+                1,
+                "phone",
+                "extra"
+            ]]))
+            .is_err());
     }
 }
