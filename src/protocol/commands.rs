@@ -406,7 +406,7 @@ pub struct ListSessionsResponse {
 }
 
 /// Represents information about a user session.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SessionInfo {
     #[serde(rename = "timestamp")]
     pub timestamp: i64,
@@ -424,6 +424,150 @@ pub struct SessionInfo {
     pub id: String,
     #[serde(rename = "alive")]
     pub alive: i32,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionInfoObject {
+    #[serde(rename = "timestamp")]
+    timestamp: i64,
+    #[serde(rename = "mru")]
+    mru: i64,
+    #[serde(rename = "user_agent")]
+    user_agent: String,
+    #[serde(rename = "ip")]
+    ip: String,
+    #[serde(rename = "country")]
+    country: String,
+    #[serde(rename = "current")]
+    current: i32,
+    #[serde(rename = "id")]
+    id: String,
+    #[serde(rename = "alive")]
+    alive: i32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum SessionInfoRepr {
+    Object(SessionInfoObject),
+    Sequence9(
+        (
+            i64,
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i32,
+            String,
+            i32,
+            Option<String>,
+        ),
+    ),
+    Sequence8(
+        (
+            i64,
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i32,
+            String,
+            i32,
+        ),
+    ),
+    Sequence6(
+        (
+            i64,
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i32,
+        ),
+    ),
+}
+
+impl From<SessionInfoObject> for SessionInfo {
+    fn from(value: SessionInfoObject) -> Self {
+        Self {
+            timestamp: value.timestamp,
+            mru: value.mru,
+            user_agent: value.user_agent,
+            ip: value.ip,
+            country: value.country,
+            current: value.current,
+            id: value.id,
+            alive: value.alive,
+        }
+    }
+}
+
+impl From<SessionInfoRepr> for SessionInfo {
+    fn from(value: SessionInfoRepr) -> Self {
+        match value {
+            SessionInfoRepr::Object(value) => value.into(),
+            SessionInfoRepr::Sequence9((
+                timestamp,
+                mru,
+                user_agent,
+                ip,
+                country,
+                current,
+                id,
+                alive,
+                _device_id,
+            )) => Self {
+                timestamp,
+                mru,
+                user_agent: user_agent.unwrap_or_default(),
+                ip: ip.unwrap_or_default(),
+                country: country.unwrap_or_default(),
+                current,
+                id,
+                alive,
+            },
+            SessionInfoRepr::Sequence8((
+                timestamp,
+                mru,
+                user_agent,
+                ip,
+                country,
+                current,
+                id,
+                alive,
+            )) => Self {
+                timestamp,
+                mru,
+                user_agent: user_agent.unwrap_or_default(),
+                ip: ip.unwrap_or_default(),
+                country: country.unwrap_or_default(),
+                current,
+                id,
+                alive,
+            },
+            SessionInfoRepr::Sequence6((timestamp, mru, user_agent, ip, country, current)) => {
+                Self {
+                    timestamp,
+                    mru,
+                    user_agent: user_agent.unwrap_or_default(),
+                    ip: ip.unwrap_or_default(),
+                    country: country.unwrap_or_default(),
+                    current,
+                    id: String::default(),
+                    alive: 0,
+                }
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionInfo {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(SessionInfoRepr::deserialize(deserializer)?.into())
+    }
 }
 
 /// Response for the `Request::KillSessions` message.
@@ -728,4 +872,60 @@ where
         seq.serialize_element(item.expose_secret())?;
     }
     seq.end()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use json::json;
+
+    #[test]
+    fn list_sessions_response_accepts_megas_sequence_shape() {
+        let request = Request::ListSessions { x: Some(1) };
+        let value = json!([[
+            1716920000,
+            1716921111,
+            "Firefox",
+            "203.0.113.4",
+            "US",
+            1,
+            "abcdef01",
+            1
+        ]]);
+
+        let Response::ListSessions(response) = request.parse_response_data(value).unwrap() else {
+            panic!("expected list sessions response");
+        };
+
+        assert_eq!(
+            response.sessions,
+            vec![SessionInfo {
+                timestamp: 1716920000,
+                mru: 1716921111,
+                user_agent: String::from("Firefox"),
+                ip: String::from("203.0.113.4"),
+                country: String::from("US"),
+                current: 1,
+                id: String::from("abcdef01"),
+                alive: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn list_sessions_response_treats_null_text_fields_as_empty() {
+        let request = Request::ListSessions { x: Some(1) };
+        let value = json!([[1716920000, 1716921111, null, null, null, 0, "abcdef01", 0, "phone"]]);
+
+        let Response::ListSessions(response) = request.parse_response_data(value).unwrap() else {
+            panic!("expected list sessions response");
+        };
+
+        assert_eq!(response.sessions.len(), 1);
+        assert_eq!(response.sessions[0].user_agent, "");
+        assert_eq!(response.sessions[0].ip, "");
+        assert_eq!(response.sessions[0].country, "");
+        assert_eq!(response.sessions[0].id, "abcdef01");
+        assert_eq!(response.sessions[0].alive, 0);
+    }
 }
