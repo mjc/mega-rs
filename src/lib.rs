@@ -396,6 +396,31 @@ impl Client {
         self.state.session.is_some()
     }
 
+    fn decode_optional_base64_string(value: Option<&str>) -> Result<Option<String>> {
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        let decoded = BASE64_URL_SAFE_NO_PAD.decode(value)?;
+        if decoded.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(String::from_utf8(decoded)?))
+    }
+
+    fn decode_optional_base64_u32(value: Option<&str>) -> Result<Option<u32>> {
+        let Some(value) = Self::decode_optional_base64_string(value)? else {
+            return Ok(None);
+        };
+        Ok(Some(value.parse::<u32>()?))
+    }
+
+    fn decode_optional_base64_i32(value: Option<&str>) -> Result<Option<i32>> {
+        let Some(value) = Self::decode_optional_base64_string(value)? else {
+            return Ok(None);
+        };
+        Ok(Some(value.parse::<i32>()?))
+    }
+
     /// Get information about the current user.
     pub async fn get_current_user_info(&self) -> Result<UserInfo> {
         let request = Request::UserInfo { v: None };
@@ -422,36 +447,19 @@ impl Client {
                 String::from_utf8(decoded)?
             },
             email: response.email.clone(),
-            country_code: 'result: {
-                let Some(country) = &response.country else {
-                    break 'result None;
-                };
-                let decoded = BASE64_URL_SAFE_NO_PAD.decode(&country)?;
-                let country = String::from_utf8(decoded)?;
-                Some(country)
-            },
+            country_code: Self::decode_optional_base64_string(response.country.as_deref())?,
             birth_date: 'result: {
-                let Some(day) = &response.birthday else {
+                let Some(day) = Self::decode_optional_base64_u32(response.birthday.as_deref())?
+                else {
                     break 'result None;
                 };
-                let Some(month) = &response.birthmonth else {
+                let Some(month) = Self::decode_optional_base64_u32(response.birthmonth.as_deref())?
+                else {
                     break 'result None;
                 };
-                let Some(year) = &response.birthyear else {
+                let Some(year) = Self::decode_optional_base64_i32(response.birthyear.as_deref())?
+                else {
                     break 'result None;
-                };
-
-                let day: u32 = {
-                    let decoded = BASE64_URL_SAFE_NO_PAD.decode(&day)?;
-                    String::from_utf8(decoded)?.parse::<u32>()?
-                };
-                let month: u32 = {
-                    let decoded = BASE64_URL_SAFE_NO_PAD.decode(&month)?;
-                    String::from_utf8(decoded)?.parse::<u32>()?
-                };
-                let year: i32 = {
-                    let decoded = BASE64_URL_SAFE_NO_PAD.decode(&year)?;
-                    String::from_utf8(decoded)?.parse::<i32>()?
                 };
 
                 NaiveDate::from_ymd_opt(year, month, day)
@@ -2777,4 +2785,33 @@ pub struct UserInfo {
     pub birth_date: Option<NaiveDate>,
     /// The country code of the user.
     pub country_code: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn optional_base64_fields_treat_empty_payload_as_missing() {
+        assert_eq!(
+            Client::decode_optional_base64_string(Some("")).unwrap(),
+            None
+        );
+        assert_eq!(
+            Client::decode_optional_base64_string(Some(&BASE64_URL_SAFE_NO_PAD.encode("US")))
+                .unwrap(),
+            Some(String::from("US"))
+        );
+        assert_eq!(Client::decode_optional_base64_u32(Some("")).unwrap(), None);
+        assert_eq!(
+            Client::decode_optional_base64_u32(Some(&BASE64_URL_SAFE_NO_PAD.encode("12"))).unwrap(),
+            Some(12)
+        );
+        assert_eq!(Client::decode_optional_base64_i32(Some("")).unwrap(), None);
+        assert_eq!(
+            Client::decode_optional_base64_i32(Some(&BASE64_URL_SAFE_NO_PAD.encode("2024")))
+                .unwrap(),
+            Some(2024)
+        );
+    }
 }
