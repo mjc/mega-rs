@@ -1979,7 +1979,11 @@ mod tests {
         assert_eq!(bytes, fixture.plaintext);
         assert_eq!(
             callbacks.verified_chunks(),
-            fixture.chunks.iter().map(|chunk| chunk.index).collect::<Vec<_>>()
+            fixture
+                .chunks
+                .iter()
+                .map(|chunk| chunk.index)
+                .collect::<Vec<_>>()
         );
     }
 
