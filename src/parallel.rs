@@ -1483,8 +1483,11 @@ mod tests {
             let start_usize = usize::try_from(start).map_err(std::io::Error::other)?;
             let end_usize = usize::try_from(end).map_err(std::io::Error::other)?;
             let bytes = self.encrypted[start_usize..=end_usize].to_vec();
-            let stream = stream::iter([Ok::<Bytes, std::io::Error>(Bytes::from(bytes))])
-                .chain(stream::pending::<std::io::Result<Bytes>>());
+            let stream = stream::iter([Ok::<Bytes, std::io::Error>(Bytes::from(bytes))]).chain(
+                stream::poll_fn(|_| {
+                    panic!("download polled the HTTP body after receiving its complete range")
+                }),
+            );
             Ok(Box::pin(stream))
         }
 
@@ -2181,7 +2184,9 @@ mod tests {
         file.set_len(fixture.plaintext.len() as u64).await.unwrap();
 
         timeout(
-            Duration::from_secs(2),
+            // The tail guard checks the behavior directly; this is only a
+            // deadlock watchdog, not a filesystem/CPU performance assertion.
+            Duration::from_secs(30),
             download_parallel_resumable_to_file(
                 &http,
                 &fixture.node,
