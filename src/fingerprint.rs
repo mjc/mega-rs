@@ -94,7 +94,7 @@ impl NodeFingerprint {
 /// Here is an example of how to use this function:
 /// ```rust,no_run
 /// # async fn example() -> mega::Result<()> {
-/// # let http_client = reqwest::Client::new();
+/// # let http_client = mega::http_client_builder()?.build()?;
 /// # let mega = mega::Client::builder().build(http_client)?;
 /// use tokio_util::compat::TokioAsyncReadCompatExt;
 ///
@@ -194,7 +194,7 @@ pub async fn compute_sparse_checksum<R: AsyncRead>(reader: R, size: u64) -> Resu
 /// Here is an example of how to use this function:
 /// ```rust,no_run
 /// # async fn example() -> mega::Result<()> {
-/// # let http_client = reqwest::Client::new();
+/// # let http_client = mega::http_client_builder()?.build()?;
 /// # let mega = mega::Client::builder().build(http_client)?;
 /// use tokio_util::compat::TokioAsyncReadCompatExt;
 ///

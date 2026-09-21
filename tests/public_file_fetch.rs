@@ -11,7 +11,7 @@ async fn public_url_fetch_test() {
         return;
     };
 
-    let http_client = reqwest::Client::new();
+    let http_client = mega::http_client_builder().unwrap().build().unwrap();
     let mega = mega::Client::builder().build(http_client).unwrap();
 
     let _nodes = mega

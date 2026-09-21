@@ -69,7 +69,7 @@ async fn main() {
         panic!("expected 2 command-line arguments: {{local_file_path}} {{distant_file_path}}");
     };
 
-    let http_client = reqwest::Client::new();
+    let http_client = mega::http_client_builder().unwrap().build().unwrap();
     let mut mega = mega::Client::builder().build(http_client).unwrap();
 
     mega.login(&email, &password, mfa.as_deref()).await.unwrap();

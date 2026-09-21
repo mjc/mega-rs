@@ -88,14 +88,24 @@ You can see examples of how to use this library by looking at [**the different e
 TLS backend selection
 ---------------------
 
-- The default feature set enables the `rustls-tls` feature, so reqwest uses the pure-Rust Rustls TLS stack with Mozilla's bundled root certificates.
-- To additionally trust certificates from the operating system's certificate store when they are available, enable `rustls-native-roots`. This keeps Rustls as the TLS implementation and retains the bundled roots as a fallback:
+- The default feature set enables the `rustls-tls` feature, so reqwest uses Rustls with the RustCrypto cryptography provider and Mozilla's bundled root certificates. RustCrypto is experimental; see its upstream warning before using this backend for security-sensitive production deployments.
+- Construct clients through the fallible helper below. It supplies a client-local RustCrypto configuration without installing a process-global provider. Direct `reqwest::Client::new()` requires the caller to configure its own provider.
+
+  ```rust
+  let http_client = mega::http_client_builder()?.build()?;
+  ```
+
+- To additionally trust certificates from the operating system's certificate store when they are available, enable `rustls-native-roots`. This keeps Rustls and RustCrypto as the TLS implementation and retains the bundled roots as a fallback:
 
   ```bash
   cargo build --features "rustls-native-roots"
   ```
 
   With `--no-default-features`, enable any additional crate features you need explicitly. For example, use `--features "rustls-native-roots,parallel"` to use system roots with parallel downloads. `reqwest` remains a transitive dependency of the TLS backend features.
+
+The provider is vendored at upstream revision `70f76c039e587192688af18a80d5d6435dedaf22` because the published alpha still depends on the obsolete webpki 0.102 branch. Its unmaintained `paste` macro dependency is replaced with `pastey`; see [provenance and local changes](vendor/rustls-rustcrypto/LOCAL-CHANGES.md). The helper disables client authentication and rejects private-key loading. Its RSA dependency is used for public-key signature verification only; the RSA private-operation timing advisory remains unresolved upstream and is explicitly excepted in dependency checks for this usage. Do not reuse that exception for RSA signing or decryption. Transport and certificate validation failures are returned as errors.
+
+The helper exposes only supported transport settings. TLS trust and protocol settings cannot be changed through reqwest setters that would silently be ignored. HTTP/2 requires mega's `http2` feature; `.http1_only()` restricts both HTTP negotiation and TLS ALPN.
 
 License
 -------

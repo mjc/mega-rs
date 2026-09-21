@@ -24,7 +24,7 @@ futures-timer = "3.0.3"
 sluice = "0.5.5"
 
 # Error handling
-thiserror = "1.0.64"
+thiserror = "2.0.20"
 
 # Miscellaneous
 url = "2.5.2"
@@ -48,8 +48,12 @@ num-bigint-dig = { version = "0.8.4", features = ["zeroize"] }
 crc32fast = "1.4.2"
 hmac = "0.12.1"
 
-# `reqwest` support (Rustls is the only TLS implementation)
+# `reqwest` support (Rustls with the RustCrypto provider is the only TLS implementation)
 reqwest = { version = "0.12.8", default-features = false, features = ["json", "stream"], optional = true }
+rustls-rustcrypto = { version = "0.0.2-alpha", path = "vendor/rustls-rustcrypto", default-features = false, features = ["std", "tls12", "zeroize"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"], optional = true }
+webpki-roots = { version = "1", optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
 tokio = { version = "1.40.0", features = ["time", "rt-multi-thread"], optional = true }
 tokio-util = { version = "0.7.12", features = ["compat", "codec"], optional = true }
 bytes = "1"
@@ -62,9 +66,10 @@ secrecy = { version = "0.10.2", features = ["serde"] }
 default = ["reqwest", "rustls-tls"]
 reqwest = ["dep:reqwest", "dep:tokio", "dep:tokio-util"]
 parallel = ["reqwest"]
-rustls-tls = ["reqwest", "reqwest/rustls-tls"]
+http2 = ["reqwest", "reqwest/http2"]
+rustls-tls = ["reqwest", "dep:rustls", "dep:rustls-rustcrypto", "dep:webpki-roots", "reqwest/rustls-tls-webpki-roots-no-provider"]
 # Keep the bundled Mozilla roots as a fallback when a platform store is absent.
-rustls-native-roots = ["rustls-tls", "reqwest/rustls-tls-native-roots"]
+rustls-native-roots = ["rustls-tls", "dep:rustls-native-certs"]
 
 [dev-dependencies]
 async-read-progress = "0.2.0"

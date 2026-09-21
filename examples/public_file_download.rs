@@ -70,7 +70,7 @@ async fn main() {
         }
     };
 
-    let http_client = reqwest::Client::new();
+    let http_client = mega::http_client_builder().unwrap().build().unwrap();
     let mut mega = mega::Client::builder().build(http_client).unwrap();
 
     run(&mut mega, public_url, distant_file_path).await.unwrap();

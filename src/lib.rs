@@ -53,6 +53,14 @@ use crate::utils::rsa::RsaPrivateKey;
 
 pub(crate) const DEFAULT_API_ORIGIN: &str = "https://g.api.mega.co.nz/";
 
+#[cfg(feature = "rustls-tls")]
+mod tls;
+#[cfg(feature = "reqwest")]
+pub use tls_client::{http_client_builder, HttpClientBuilder};
+
+#[cfg(feature = "reqwest")]
+mod tls_client;
+
 async fn collect_http_body(mut body: crate::http::HttpGetStream) -> Result<Vec<u8>> {
     let mut buffer = Vec::new();
     while let Some(chunk) = body.try_next().await? {
