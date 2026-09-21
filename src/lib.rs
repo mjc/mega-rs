@@ -217,7 +217,7 @@ impl Client {
                 user_handle[..4].copy_from_slice(&hash[0..4]);
                 user_handle[4..].copy_from_slice(&hash[8..12]);
 
-                let user_handle = BASE64_URL_SAFE_NO_PAD.encode(&user_handle);
+                let user_handle = BASE64_URL_SAFE_NO_PAD.encode(user_handle);
 
                 (key, user_handle)
             }
@@ -249,7 +249,7 @@ impl Client {
             user_handle: Some(user_handle.clone().into()),
             si: None,
             mfa: mfa.map(|it| it.to_string().into()),
-            sek: Some(BASE64_URL_SAFE_NO_PAD.encode(&sek).into()),
+            sek: Some(BASE64_URL_SAFE_NO_PAD.encode(sek).into()),
         };
         let responses = self.send_requests(&[request]).await?;
 
@@ -342,7 +342,7 @@ impl Client {
             user_handle: None,
             si: None,
             mfa: None,
-            sek: Some(BASE64_URL_SAFE_NO_PAD.encode(&sek).into()),
+            sek: Some(BASE64_URL_SAFE_NO_PAD.encode(sek).into()),
         };
         let responses = self
             .client
@@ -582,7 +582,7 @@ impl Client {
         };
 
         let mut nodes = HashMap::<String, Node>::default();
-        let share_keys = utils::extract_share_keys(&session, attr)?;
+        let share_keys = utils::extract_share_keys(session, attr)?;
 
         // This method of getting share keys seems to be unneeded.
         // (maybe an earlier implementation that got decommissionned/deprecated ?).
@@ -597,7 +597,7 @@ impl Client {
             let (thumbnail_handle, preview_image_handle) = file
                 .file_attr
                 .as_deref()
-                .map(|attr| utils::extract_attachments(attr))
+                .map(utils::extract_attachments)
                 .unwrap_or_default();
 
             match file.kind {
@@ -670,7 +670,7 @@ impl Client {
 
                         if let Some(share_key) = share_keys.get(file_user) {
                             // shared file or folder
-                            utils::decrypt_ebc_in_place(&share_key, &mut file_key);
+                            utils::decrypt_ebc_in_place(share_key, &mut file_key);
                             return Some(file_key);
                         }
 
@@ -983,7 +983,7 @@ impl Client {
                             let (thumbnail_handle, preview_image_handle) = file
                                 .file_attr
                                 .as_deref()
-                                .map(|attr| utils::extract_attachments(attr))
+                                .map(utils::extract_attachments)
                                 .unwrap_or_default();
 
                             let fingerprint = attrs.extract_fingerprint();
@@ -1101,7 +1101,7 @@ impl Client {
             let derived_key: Vec<u8> = key
                 .iter()
                 .copied()
-                .zip(dec_key.into_iter())
+                .zip(dec_key)
                 .map(|(a, b)| a ^ b)
                 .collect();
 
@@ -1286,7 +1286,6 @@ impl Client {
 
         let condensed_mac_future = {
             let aes_key = node.aes_key;
-            let aes_iv = aes_iv;
             async move {
                 fingerprint::compute_condensed_mac(condensed_mac_reader, size, &aes_key, &aes_iv)
                     .await
@@ -1430,6 +1429,7 @@ impl Client {
     /// plaintext, and reported through `chunk_verified` only after the chunk
     /// has been written, flushed, and durably synced through the writer.
     #[cfg(feature = "parallel")]
+    #[allow(clippy::too_many_arguments)]
     pub async fn download_node_parallel_resumable_with_progress<W, F, C>(
         &self,
         node: &Node,
@@ -1512,6 +1512,7 @@ impl Client {
     }
 
     #[cfg(feature = "parallel")]
+    #[allow(clippy::too_many_arguments)]
     pub async fn download_node_parallel_resumable_to_file_with_progress<F, C>(
         &self,
         node: &Node,
@@ -1724,7 +1725,7 @@ impl Client {
 
         utils::encrypt_ebc_in_place(&session.key, &mut key);
 
-        let key_b64 = BASE64_URL_SAFE_NO_PAD.encode(&key);
+        let key_b64 = BASE64_URL_SAFE_NO_PAD.encode(key);
 
         let attrs = UploadAttributes {
             kind: NodeKind::File,
@@ -1817,7 +1818,7 @@ impl Client {
             }
 
             if bytes_read < 16 {
-                let padding = std::iter::repeat(0).take(16 - bytes_read);
+                let padding = std::iter::repeat_n(0, 16 - bytes_read);
                 block.extend(padding);
             }
 
@@ -1896,7 +1897,7 @@ impl Client {
                 }
 
                 if bytes_read < 16 {
-                    let padding = std::iter::repeat(0).take(16 - bytes_read);
+                    let padding = std::iter::repeat_n(0, 16 - bytes_read);
                     block.extend(padding);
                 }
 
@@ -1988,7 +1989,7 @@ impl Client {
 
         utils::encrypt_ebc_in_place(&session.key, &mut aes_key);
 
-        let key_b64 = BASE64_URL_SAFE_NO_PAD.encode(&aes_key);
+        let key_b64 = BASE64_URL_SAFE_NO_PAD.encode(aes_key);
 
         let attrs = UploadAttributes {
             kind: NodeKind::Folder,
@@ -2190,7 +2191,7 @@ impl Client {
                         .nodes
                         .files
                         .into_iter()
-                        .filter_map(|file| construct_event_node(&session, nodes, file).transpose())
+                        .filter_map(|file| construct_event_node(session, nodes, file).transpose())
                         .collect::<Result<_, _>>()?;
 
                     events.push(Event::NodeCreated { nodes });
@@ -2277,7 +2278,7 @@ impl Client {
                         .nodes
                         .files
                         .into_iter()
-                        .filter_map(|file| construct_event_node(&session, nodes, file).transpose())
+                        .filter_map(|file| construct_event_node(session, nodes, file).transpose())
                         .collect::<Result<_, _>>()?;
 
                     events.push(Event::NodeCreated { nodes });
@@ -2329,10 +2330,16 @@ impl Client {
     }
 }
 
-fn unpack_node_key(
-    node_kind: NodeKind,
-    mut file_key: Vec<u8>,
-) -> Option<(Vec<u8>, [u8; 16], Option<[u8; 8]>, Option<[u8; 8]>)> {
+type UnpackedNodeKey = (Vec<u8>, [u8; 16], Option<[u8; 8]>, Option<[u8; 8]>);
+type DecodedPublicNode = (
+    Vec<u8>,
+    [u8; 16],
+    Option<[u8; 8]>,
+    Option<[u8; 8]>,
+    NodeAttributes,
+);
+
+fn unpack_node_key(node_kind: NodeKind, mut file_key: Vec<u8>) -> Option<UnpackedNodeKey> {
     if (node_kind.is_file() && file_key.len() != FILE_KEY_SIZE)
         || (!node_kind.is_file() && file_key.len() != FOLDER_KEY_SIZE)
     {
@@ -2359,13 +2366,7 @@ fn decode_public_node_with_attrs(
     encrypted_key: &str,
     encrypted_attr: &str,
     folder_key: &[u8],
-) -> Option<(
-    Vec<u8>,
-    [u8; 16],
-    Option<[u8; 8]>,
-    Option<[u8; 8]>,
-    NodeAttributes,
-)> {
+) -> Option<DecodedPublicNode> {
     if encrypted_key.len() >= 44 {
         return None;
     }
@@ -2389,7 +2390,7 @@ fn construct_event_node(
     let (thumbnail_handle, preview_image_handle) = file
         .file_attr
         .as_deref()
-        .map(|attr| utils::extract_attachments(attr))
+        .map(utils::extract_attachments)
         .unwrap_or_default();
 
     match file.kind {
@@ -2949,10 +2950,15 @@ impl Nodes {
         self.nodes.len()
     }
 
+    /// Returns whether this collection contains no nodes.
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
     /// Creates an iterator over all the root nodes.
     pub fn roots(&self) -> impl Iterator<Item = &Node> {
         self.nodes.values().filter(|node| {
-            node.parent.as_ref().map_or(true, |parent| {
+            node.parent.as_ref().is_none_or(|parent| {
                 // Root nodes from public links can still have
                 // a `parent` handle associated with them, but that
                 // parent won't be found in the current collection.
@@ -2975,8 +2981,8 @@ impl Nodes {
         };
 
         let root = self.roots().find(|node| node.name == root)?;
-        path.split('/').fold(Some(root), |node, name| {
-            node?.children.iter().find_map(|handle| {
+        path.split('/').try_fold(root, |node, name| {
+            node.children.iter().find_map(|handle| {
                 let found = self.get_node_by_handle(handle)?;
                 (found.name == name).then_some(found)
             })

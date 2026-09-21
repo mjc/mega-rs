@@ -53,7 +53,7 @@ impl NodeFingerprint {
             }
 
             mtime[..byte_count]
-                .into_iter()
+                .iter()
                 .rev()
                 .copied()
                 .fold(0, |acc, byte| (acc << 8) + i64::from(byte))
@@ -63,7 +63,7 @@ impl NodeFingerprint {
     }
 
     pub fn serialize(&self) -> String {
-        let mut buffer = vec![0u8; 16 + 8];
+        let mut buffer = [0u8; 16 + 8];
 
         buffer[..16].copy_from_slice(&self.checksum);
 
@@ -154,10 +154,7 @@ pub async fn compute_sparse_checksum<R: AsyncRead>(reader: R, size: u64) -> Resu
         }
         size => {
             // large file: sparse coverage, four sparse CRC32s.
-            let mut reader = {
-                let size = u64::try_from(size).unwrap();
-                pin!(reader.take(size))
-            };
+            let mut reader = { pin!(reader.take(size)) };
 
             let mut block = [0u8; BLOCK_SIZE as usize];
             let blocks = MAXFULL / (BLOCK_SIZE * 4);
@@ -171,7 +168,7 @@ pub async fn compute_sparse_checksum<R: AsyncRead>(reader: R, size: u64) -> Resu
                     let offset = (size - BLOCK_SIZE) * (idx * blocks + blk) / (4 * blocks - 1);
                     let gap = offset - cursor;
                     futures::io::copy((&mut reader).take(gap), &mut futures::io::sink()).await?;
-                    (&mut reader).read_exact(&mut block).await?;
+                    reader.read_exact(&mut block).await?;
                     hasher.update(&block);
                     cursor = offset + BLOCK_SIZE;
                 }
@@ -272,7 +269,7 @@ pub async fn compute_condensed_mac<R: AsyncRead>(
     }
 
     for i in 0..4 {
-        final_mac_data[i] = final_mac_data[i] ^ final_mac_data[i + 4];
+        final_mac_data[i] ^= final_mac_data[i + 4];
         final_mac_data[i + 4] = final_mac_data[i + 8] ^ final_mac_data[i + 12];
     }
 
@@ -817,7 +814,7 @@ impl ParallelMacProcessor {
     ) -> Result<Option<Vec<u8>>> {
         if offset_in_chunk
             .checked_add(data.len())
-            .map_or(true, |end| end > actual_chunk_size)
+            .is_none_or(|end| end > actual_chunk_size)
         {
             return Err(parallel_chunk_data_error(
                 offset_in_chunk,
@@ -846,9 +843,9 @@ impl ParallelMacProcessor {
                 }
 
                 let mut new_bytes = 0;
-                for idx in offset_in_chunk..offset_in_chunk + data.len() {
-                    if state.coverage[idx] == 0 {
-                        state.coverage[idx] = 1;
+                for covered in &mut state.coverage[offset_in_chunk..offset_in_chunk + data.len()] {
+                    if *covered == 0 {
+                        *covered = 1;
                         new_bytes += 1;
                     }
                 }
@@ -862,9 +859,7 @@ impl ParallelMacProcessor {
                 let mut buf = vec![0u8; actual_chunk_size];
                 buf[offset_in_chunk..offset_in_chunk + data.len()].copy_from_slice(data);
                 let mut coverage = vec![0u8; actual_chunk_size];
-                for idx in offset_in_chunk..offset_in_chunk + data.len() {
-                    coverage[idx] = 1;
-                }
+                coverage[offset_in_chunk..offset_in_chunk + data.len()].fill(1);
 
                 states[chunk_idx] = Some(ChunkState {
                     data: buf,
@@ -972,7 +967,7 @@ pub fn compute_condensed_mac_from_buffer(
     }
 
     for i in 0..4 {
-        final_mac_data[i] = final_mac_data[i] ^ final_mac_data[i + 4];
+        final_mac_data[i] ^= final_mac_data[i + 4];
         final_mac_data[i + 4] = final_mac_data[i + 8] ^ final_mac_data[i + 12];
     }
 

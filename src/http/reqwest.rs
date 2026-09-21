@@ -137,7 +137,7 @@ impl HttpClient for reqwest::Client {
             .await?
             .error_for_status()?
             .bytes_stream()
-            .map_err(|err| io::Error::new(io::ErrorKind::Other, err));
+            .map_err(io::Error::other);
 
         Ok(Box::pin(stream))
     }
@@ -149,7 +149,7 @@ impl HttpClient for reqwest::Client {
             .await?
             .error_for_status()?
             .bytes_stream()
-            .map_err(|err| io::Error::new(io::ErrorKind::Other, err));
+            .map_err(io::Error::other);
 
         Ok(Box::pin(stream))
     }
@@ -175,7 +175,7 @@ impl HttpClient for reqwest::Client {
                 .await?
                 .error_for_status()?
                 .bytes_stream()
-                .map_err(|err| io::Error::new(io::ErrorKind::Other, err))
+                .map_err(io::Error::other)
         };
 
         Ok(Box::pin(stream.into_async_read()))

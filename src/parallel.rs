@@ -131,9 +131,12 @@ pub trait ParallelDownloadCallbacks: Send + Sync {
     }
 }
 
+type ProgressCallback = Arc<dyn Fn(u64) + Send + Sync>;
+type ChunkVerifiedCallback = Arc<dyn Fn(u32, [u8; 16]) + Send + Sync>;
+
 struct FnDownloadCallbacks {
-    progress: Option<Arc<dyn Fn(u64) + Send + Sync>>,
-    chunk_verified: Option<Arc<dyn Fn(u32, [u8; 16]) + Send + Sync>>,
+    progress: Option<ProgressCallback>,
+    chunk_verified: Option<ChunkVerifiedCallback>,
 }
 
 impl ParallelDownloadCallbacks for FnDownloadCallbacks {
@@ -159,8 +162,8 @@ impl ParallelDownloadCallbacks for FnDownloadCallbacks {
 }
 
 fn callbacks_from_parts(
-    progress: Option<Arc<dyn Fn(u64) + Send + Sync>>,
-    chunk_verified: Option<Arc<dyn Fn(u32, [u8; 16]) + Send + Sync>>,
+    progress: Option<ProgressCallback>,
+    chunk_verified: Option<ChunkVerifiedCallback>,
 ) -> Option<Arc<dyn ParallelDownloadCallbacks>> {
     if progress.is_some() || chunk_verified.is_some() {
         Some(Arc::new(FnDownloadCallbacks {
@@ -365,14 +368,10 @@ fn resize_download_buffer(buffer_pool: &ChunkBufferPool, target_size: usize) -> 
 
 async fn download_worker(client: &dyn HttpClient, ctx: DownloadContext) -> Result<()> {
     let mut url_buffer = String::with_capacity(ctx.base_url.len() + 48);
-    loop {
-        let Some(run) =
-            ctx.claim_cursor
-                .claim(&ctx.chunks, &ctx.trusted_chunks, ctx.max_chunks_per_request)
-        else {
-            break;
-        };
-
+    while let Some(run) =
+        ctx.claim_cursor
+            .claim(&ctx.chunks, &ctx.trusted_chunks, ctx.max_chunks_per_request)
+    {
         run.write_url(&ctx.chunks, &ctx.base_url, &mut url_buffer);
         let mut response = client.get_str(&url_buffer).await?;
         let mut current_idx = run.start;
@@ -450,6 +449,7 @@ async fn download_worker(client: &dyn HttpClient, ctx: DownloadContext) -> Resul
 // Processor
 // ============================================================================
 
+#[allow(clippy::too_many_arguments)]
 async fn process_chunks<W>(
     mut rx: mpsc::Receiver<DownloadedChunk>,
     mut writer: W,
@@ -542,14 +542,10 @@ async fn stream_download_worker_to_file(
     let mut url_buffer = String::with_capacity(ctx.base_url.len() + 48);
     let mut chunk_buffer = Vec::new();
 
-    loop {
-        let Some(run) =
-            ctx.claim_cursor
-                .claim(&ctx.chunks, &ctx.trusted_chunks, ctx.max_chunks_per_request)
-        else {
-            break;
-        };
-
+    while let Some(run) =
+        ctx.claim_cursor
+            .claim(&ctx.chunks, &ctx.trusted_chunks, ctx.max_chunks_per_request)
+    {
         run.write_url(&ctx.chunks, &ctx.base_url, &mut url_buffer);
         let mut response = client.get_str(&url_buffer).await?;
         let mut current_idx = run.start;
@@ -663,6 +659,7 @@ async fn stream_download_worker_to_file(
 /// Downloads a file using parallel connections.
 ///
 /// Downloads run in parallel and don't block on processing.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn download_parallel<W>(
     client: &dyn HttpClient,
     node: &Node,
@@ -671,7 +668,7 @@ pub(crate) async fn download_parallel<W>(
     writer: W,
     num_connections: usize,
     max_chunks_per_request: Option<usize>,
-    progress_callback: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+    progress_callback: Option<ProgressCallback>,
     aes_iv: [u8; 8],
     expected_mac: [u8; 8],
 ) -> Result<()>
@@ -696,6 +693,7 @@ where
 }
 
 /// Downloads a file using parallel connections, skipping preverified plaintext chunks.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn download_parallel_resumable<W>(
     client: &dyn HttpClient,
     node: &Node,
@@ -704,9 +702,9 @@ pub(crate) async fn download_parallel_resumable<W>(
     writer: W,
     num_connections: usize,
     max_chunks_per_request: Option<usize>,
-    progress_callback: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+    progress_callback: Option<ProgressCallback>,
     trusted_chunks: Option<Arc<[Option<[u8; 16]>]>>,
-    chunk_verified: Option<Arc<dyn Fn(u32, [u8; 16]) + Send + Sync>>,
+    chunk_verified: Option<ChunkVerifiedCallback>,
     aes_iv: [u8; 8],
     expected_mac: [u8; 8],
 ) -> Result<()>
@@ -730,6 +728,7 @@ where
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn download_parallel_resumable_with_callbacks<W>(
     client: &dyn HttpClient,
     node: &Node,
@@ -918,6 +917,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn download_parallel_resumable_to_file(
     client: &dyn HttpClient,
     node: &Node,
@@ -926,9 +926,9 @@ pub(crate) async fn download_parallel_resumable_to_file(
     writer: tokio::fs::File,
     num_connections: usize,
     max_chunks_per_request: Option<usize>,
-    progress_callback: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+    progress_callback: Option<ProgressCallback>,
     trusted_chunks: Option<Arc<[Option<[u8; 16]>]>>,
-    chunk_verified: Option<Arc<dyn Fn(u32, [u8; 16]) + Send + Sync>>,
+    chunk_verified: Option<ChunkVerifiedCallback>,
     aes_iv: [u8; 8],
     expected_mac: [u8; 8],
 ) -> Result<()> {
@@ -949,6 +949,7 @@ pub(crate) async fn download_parallel_resumable_to_file(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn download_parallel_resumable_to_file_with_callbacks(
     client: &dyn HttpClient,
     node: &Node,
