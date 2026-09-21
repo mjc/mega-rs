@@ -1,4 +1,5 @@
-use num_bigint_dig::BigUint;
+use num_bigint_dig::{BigUint, ModInverse, RandBigInt};
+use rand::rngs::OsRng;
 use zeroize::Zeroize;
 
 use crate::{Error, Result};
@@ -9,6 +10,7 @@ pub struct RsaPrivateKey {
     pub q: BigUint,
     pub d: BigUint,
     pub u: BigUint,
+    e: BigUint,
 }
 
 impl RsaPrivateKey {
@@ -23,8 +25,8 @@ impl RsaPrivateKey {
         let d = BigUint::from_bytes_be(d);
         let u = BigUint::from_bytes_be(u);
 
-        if p <= one
-            || q <= one
+        if p <= BigUint::from(2u8)
+            || q <= BigUint::from(2u8)
             || p == q
             || d == BigUint::from(0u8)
             || u == BigUint::from(0u8)
@@ -36,7 +38,15 @@ impl RsaPrivateKey {
             return Err(Error::InvalidRsaPrivateKeyFormat);
         }
 
-        Ok(Self { p, q, d, u })
+        let phi = (&p - &one) * (&q - &one);
+        let e = d
+            .clone()
+            .mod_inverse(&phi)
+            .and_then(|e| e.to_biguint())
+            .filter(|e| e > &one)
+            .ok_or(Error::InvalidRsaPrivateKeyFormat)?;
+
+        Ok(Self { p, q, d, u, e })
     }
 
     pub fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>> {
@@ -50,7 +60,9 @@ impl RsaPrivateKey {
             return Err(Error::InvalidRsaInput);
         }
 
-        Ok(decrypt_rsa(&m, &self.p, &self.q, &self.d, &self.u).to_bytes_be())
+        let plaintext = decrypt_rsa_blinded(&m, &self.p, &self.q, &self.d, &self.u, &self.e)
+            .ok_or(Error::InvalidRsaInput)?;
+        Ok(plaintext.to_bytes_be())
     }
 }
 
@@ -82,6 +94,37 @@ pub(crate) fn decrypt_rsa(
         q - (((&xp - &xq) * u) % q)
     };
     t * p + xp
+}
+
+fn decrypt_rsa_blinded(
+    m: &BigUint,
+    p: &BigUint,
+    q: &BigUint,
+    d: &BigUint,
+    u: &BigUint,
+    e: &BigUint,
+) -> Option<BigUint> {
+    let modulus = p * q;
+    let two = BigUint::from(2u8);
+    let mut rng = OsRng;
+    let (r, r_inverse) = loop {
+        let r = rng.gen_biguint_range(&two, &modulus);
+        let Some(r_inverse) = r
+            .clone()
+            .mod_inverse(&modulus)
+            .and_then(|value| value.to_biguint())
+        else {
+            continue;
+        };
+        break (r, r_inverse);
+    };
+
+    // The exponentiation with the private exponent remains variable-time, but
+    // blinding makes its input independent of the attacker-controlled
+    // ciphertext and masks timing variation from the private key.
+    let blinded = (m * r.modpow(e, &modulus)) % &modulus;
+    let blinded_plaintext = decrypt_rsa(&blinded, p, q, d, u);
+    Some((blinded_plaintext * r_inverse) % modulus)
 }
 
 #[cfg(test)]
@@ -122,6 +165,7 @@ mod tests {
         assert_eq!(key.q, BigUint::from(53u8));
         assert_eq!(key.d, BigUint::from(2753u16));
         assert_eq!(key.u, BigUint::from(20u8));
+        assert_eq!(key.e, BigUint::from(17u8));
     }
 
     #[test]
@@ -172,6 +216,7 @@ mod tests {
             q: BigUint::from(53u8),
             d: BigUint::from(2753u16),
             u: BigUint::from(20u8),
+            e: BigUint::from(17u8),
         };
 
         assert!(matches!(key.decrypt(&[]), Err(Error::InvalidRsaInput)));
@@ -179,5 +224,20 @@ mod tests {
             key.decrypt(&(61u16 * 53).to_be_bytes()),
             Err(Error::InvalidRsaInput)
         ));
+    }
+
+    #[test]
+    fn blinded_decrypt_matches_rsa_plaintext() {
+        let key = RsaPrivateKey {
+            p: BigUint::from(61u8),
+            q: BigUint::from(53u8),
+            d: BigUint::from(2753u16),
+            u: BigUint::from(20u8),
+            e: BigUint::from(17u8),
+        };
+
+        for _ in 0..16 {
+            assert_eq!(key.decrypt(&2557u16.to_be_bytes()).unwrap(), [42]);
+        }
     }
 }
