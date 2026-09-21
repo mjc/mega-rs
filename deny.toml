@@ -22,6 +22,18 @@ allow = [
 [bans]
 multiple-versions = "warn"
 wildcards = "warn"
+# These are unavoidable transitive splits in the current Rust ecosystem:
+# Rustls 0.23's ring backend still uses windows-sys 0.52, while Tokio and
+# the development terminal stack use windows-sys 0.61. The proc-macro graph
+# is likewise split between the syn 2 and syn 3 generations. Keep duplicate
+# detection enabled for every other crate and revisit these exceptions when
+# their upstream dependency ranges converge.
+skip = [
+  { crate = "syn@2.0.119", reason = "required by thiserror, tracing, and zeroize while other current proc macros require syn 3" },
+  { crate = "syn@3.0.6", reason = "required by current async-trait, serde, Tokio, and ICU proc macros while other current proc macros require syn 2" },
+  { crate = "windows-sys@0.52.0", reason = "required by ring 0.17 used by Rustls 0.23" },
+  { crate = "windows-sys@0.61.2", reason = "required by current Tokio, Mio, and console versions" },
+]
 
 [sources]
 unknown-registry = "deny"
