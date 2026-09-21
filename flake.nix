@@ -22,7 +22,7 @@
         inherit system overlays;
       };
 
-      rustToolchain = pkgs.rust-bin.stable.latest.default.override {
+      rustToolchain = pkgs.rust-bin.stable."1.98.1".default.override {
         extensions = ["rust-src" "rust-analyzer"];
       };
 
