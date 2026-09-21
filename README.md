@@ -88,14 +88,14 @@ You can see examples of how to use this library by looking at [**the different e
 TLS backend selection
 ---------------------
 
-- The default feature set enables the `rustls-tls` feature, so reqwest uses the Rustls TLS stack.
-- To build with native TLS instead, disable the defaults and enable `native-tls` so `reqwest/default-tls` kicks in. For example:
+- The default feature set enables the `rustls-tls` feature, so reqwest uses the pure-Rust Rustls TLS stack with Mozilla's bundled root certificates.
+- To additionally trust certificates from the operating system's certificate store when they are available, enable `rustls-native-roots`. This keeps Rustls as the TLS implementation and retains the bundled roots as a fallback:
 
   ```bash
-  cargo build --no-default-features --features "native-tls"
+  cargo build --features "rustls-native-roots"
   ```
 
-  With `--no-default-features`, enable any additional crate features you need explicitly. For example, use `--features "native-tls,parallel"` to build with native TLS and parallel downloads. `reqwest` remains a transitive dependency of the TLS backend features.
+  With `--no-default-features`, enable any additional crate features you need explicitly. For example, use `--features "rustls-native-roots,parallel"` to use system roots with parallel downloads. `reqwest` remains a transitive dependency of the TLS backend features.
 
 License
 -------
