@@ -53,6 +53,12 @@ pub enum Error {
     /// Invalid RSA private key format.
     #[error("invalid RSA private key format")]
     InvalidRsaPrivateKeyFormat,
+    /// Invalid RSA ciphertext or key parameters.
+    #[error("invalid RSA input")]
+    InvalidRsaInput,
+    /// Invalid serialized session format.
+    #[error("invalid session format")]
+    InvalidSessionFormat,
     /// Failed condensed MAC verification.
     #[error("condensed MAC mismatch")]
     CondensedMacMismatch,

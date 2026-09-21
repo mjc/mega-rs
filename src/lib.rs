@@ -292,7 +292,10 @@ impl Client {
 
         let sid = {
             let (m, _) = utils::rsa::get_mpi(&csid)?;
-            let sid = privk.decrypt(m);
+            let sid = privk.decrypt(m)?;
+            if sid.len() < 43 {
+                return Err(Error::InvalidResponseFormat);
+            }
             BASE64_URL_SAFE_NO_PAD.encode(&sid[..43])
         };
 
@@ -310,6 +313,10 @@ impl Client {
     /// Resumes a session with MEGA from its serialized representation.
     pub async fn resume_session(&mut self, session: &str) -> Result<()> {
         let session = BASE64_URL_SAFE_NO_PAD.decode(session)?;
+
+        if session.len() < 17 {
+            return Err(Error::InvalidSessionFormat);
+        }
 
         match session[0] {
             1 => {}
@@ -613,7 +620,15 @@ impl Client {
                             // Keys bigger than this size are using RSA instead of AES.
                             let data = BASE64_URL_SAFE_NO_PAD.decode(file_key).ok()?;
                             let (encrypted, _) = utils::rsa::get_mpi(&data).ok()?;
-                            let mut decrypted = session.privk.decrypt(encrypted);
+                            let mut decrypted = session.privk.decrypt(encrypted).ok()?;
+                            let expected_len = if file.kind.is_file() {
+                                FILE_KEY_SIZE
+                            } else {
+                                FOLDER_KEY_SIZE
+                            };
+                            if decrypted.len() < expected_len {
+                                return None;
+                            }
                             if file.kind.is_file() {
                                 decrypted.truncate(FILE_KEY_SIZE);
                             } else {
@@ -2397,7 +2412,15 @@ fn construct_event_node(
                     // Keys bigger than this size are using RSA instead of AES.
                     let data = BASE64_URL_SAFE_NO_PAD.decode(file_key).ok()?;
                     let (encrypted, _) = utils::rsa::get_mpi(&data).ok()?;
-                    let mut decrypted = session.privk.decrypt(encrypted);
+                    let mut decrypted = session.privk.decrypt(encrypted).ok()?;
+                    let expected_len = if file.kind.is_file() {
+                        FILE_KEY_SIZE
+                    } else {
+                        FOLDER_KEY_SIZE
+                    };
+                    if decrypted.len() < expected_len {
+                        return None;
+                    }
                     if file.kind.is_file() {
                         decrypted.truncate(FILE_KEY_SIZE);
                     } else {

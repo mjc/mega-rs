@@ -1,13 +1,14 @@
+use num_bigint_dig::BigUint;
 use zeroize::Zeroize;
 
 use crate::{Error, Result};
 
 #[derive(Debug, Clone, Default, Zeroize)]
 pub struct RsaPrivateKey {
-    pub p: rsa::BigUint,
-    pub q: rsa::BigUint,
-    pub d: rsa::BigUint,
-    pub u: rsa::BigUint,
+    pub p: BigUint,
+    pub q: BigUint,
+    pub d: BigUint,
+    pub u: BigUint,
 }
 
 impl RsaPrivateKey {
@@ -16,21 +17,40 @@ impl RsaPrivateKey {
         let (q, data) = get_mpi(data)?;
         let (d, data) = get_mpi(data)?;
         let (u, data) = get_mpi(data)?;
+        let one = BigUint::from(1u8);
+        let p = BigUint::from_bytes_be(p);
+        let q = BigUint::from_bytes_be(q);
+        let d = BigUint::from_bytes_be(d);
+        let u = BigUint::from_bytes_be(u);
+
+        if p <= one
+            || q <= one
+            || p == q
+            || d == BigUint::from(0u8)
+            || u == BigUint::from(0u8)
+            || u >= q
+        {
+            return Err(Error::InvalidRsaPrivateKeyFormat);
+        }
         if data.len() >= 16 {
             return Err(Error::InvalidRsaPrivateKeyFormat);
         }
 
-        Ok(Self {
-            p: rsa::BigUint::from_bytes_be(p),
-            q: rsa::BigUint::from_bytes_be(q),
-            d: rsa::BigUint::from_bytes_be(d),
-            u: rsa::BigUint::from_bytes_be(u),
-        })
+        Ok(Self { p, q, d, u })
     }
 
-    pub fn decrypt(&self, data: &[u8]) -> Vec<u8> {
-        let m = rsa::BigUint::from_bytes_be(data);
-        decrypt_rsa(&m, &self.p, &self.q, &self.d, &self.u).to_bytes_be()
+    pub fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>> {
+        if data.is_empty() {
+            return Err(Error::InvalidRsaInput);
+        }
+
+        let m = BigUint::from_bytes_be(data);
+        let modulus = &self.p * &self.q;
+        if m >= modulus {
+            return Err(Error::InvalidRsaInput);
+        }
+
+        Ok(decrypt_rsa(&m, &self.p, &self.q, &self.d, &self.u).to_bytes_be())
     }
 }
 
@@ -47,13 +67,13 @@ pub(crate) fn get_mpi(data: &[u8]) -> Result<(&[u8], &[u8])> {
 }
 
 pub(crate) fn decrypt_rsa(
-    m: &rsa::BigUint,
-    p: &rsa::BigUint,
-    q: &rsa::BigUint,
-    d: &rsa::BigUint,
-    u: &rsa::BigUint,
-) -> rsa::BigUint {
-    let one = rsa::BigUint::from(1u8);
+    m: &BigUint,
+    p: &BigUint,
+    q: &BigUint,
+    d: &BigUint,
+    u: &BigUint,
+) -> BigUint {
+    let one = BigUint::from(1u8);
     let xp = (m % p).modpow(&(d % (p - &one)), p);
     let xq = (m % q).modpow(&(d % (q - &one)), q);
     let t = if xq >= xp {
@@ -70,11 +90,11 @@ mod tests {
 
     #[test]
     fn crt_decrypt_matches_direct_modpow() {
-        let p = rsa::BigUint::from(61u8);
-        let q = rsa::BigUint::from(53u8);
-        let d = rsa::BigUint::from(2753u16);
-        let u = rsa::BigUint::from(20u8);
-        let ciphertext = rsa::BigUint::from(2790u16);
+        let p = BigUint::from(61u8);
+        let q = BigUint::from(53u8);
+        let d = BigUint::from(2753u16);
+        let u = BigUint::from(20u8);
+        let ciphertext = BigUint::from(2790u16);
         let direct = ciphertext.modpow(&d, &(&p * &q));
 
         assert_eq!(decrypt_rsa(&ciphertext, &p, &q, &d, &u), direct);
@@ -98,10 +118,10 @@ mod tests {
 
         let key = RsaPrivateKey::from_mpi_bytes(&bytes).unwrap();
 
-        assert_eq!(key.p, rsa::BigUint::from(61u8));
-        assert_eq!(key.q, rsa::BigUint::from(53u8));
-        assert_eq!(key.d, rsa::BigUint::from(2753u16));
-        assert_eq!(key.u, rsa::BigUint::from(20u8));
+        assert_eq!(key.p, BigUint::from(61u8));
+        assert_eq!(key.q, BigUint::from(53u8));
+        assert_eq!(key.d, BigUint::from(2753u16));
+        assert_eq!(key.u, BigUint::from(20u8));
     }
 
     #[test]
@@ -115,7 +135,7 @@ mod tests {
 
         let key = RsaPrivateKey::from_mpi_bytes(&bytes).unwrap();
 
-        assert_eq!(key.u, rsa::BigUint::from(20u8));
+        assert_eq!(key.u, BigUint::from(20u8));
     }
 
     #[test]
@@ -130,5 +150,34 @@ mod tests {
         let err = RsaPrivateKey::from_mpi_bytes(&bytes).unwrap_err();
 
         assert!(matches!(err, Error::InvalidRsaPrivateKeyFormat));
+    }
+
+    #[test]
+    fn private_key_rejects_invalid_components() {
+        let mut bytes = Vec::new();
+        bytes.extend(mpi_bytes(&[1]));
+        bytes.extend(mpi_bytes(&[53]));
+        bytes.extend(mpi_bytes(&[0x0a, 0xc1]));
+        bytes.extend(mpi_bytes(&[20]));
+
+        let err = RsaPrivateKey::from_mpi_bytes(&bytes).unwrap_err();
+
+        assert!(matches!(err, Error::InvalidRsaPrivateKeyFormat));
+    }
+
+    #[test]
+    fn decrypt_rejects_empty_or_out_of_range_ciphertext() {
+        let key = RsaPrivateKey {
+            p: BigUint::from(61u8),
+            q: BigUint::from(53u8),
+            d: BigUint::from(2753u16),
+            u: BigUint::from(20u8),
+        };
+
+        assert!(matches!(key.decrypt(&[]), Err(Error::InvalidRsaInput)));
+        assert!(matches!(
+            key.decrypt(&(61u16 * 53).to_be_bytes()),
+            Err(Error::InvalidRsaInput)
+        ));
     }
 }
