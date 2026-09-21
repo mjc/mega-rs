@@ -35,6 +35,21 @@ It can also allow for more fine-grained control over how the operations are carr
 
 [MEGAcmd]: https://github.com/meganz/MEGAcmd
 
+Development
+-----------
+
+Enter the reproducible development environment with:
+
+```sh
+devenv shell
+```
+
+Run the standard checks with:
+
+```sh
+devenv tasks run check:all
+```
+
 Features
 --------
 
