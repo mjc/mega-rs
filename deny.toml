@@ -1,0 +1,35 @@
+[graph]
+all-features = true
+
+[advisories]
+unmaintained = "workspace"
+# Only public-key RSA verification is reachable through http_client_builder:
+# client auth is disabled and its provider refuses every private key.
+# The dependency remains affected for other uses; do not reuse it for private
+# RSA operations. See src/tls.rs and its boundary regression test.
+ignore = ["RUSTSEC-2023-0071"]
+
+[licenses]
+confidence-threshold = 0.8
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "CDLA-Permissive-2.0",
+  "ISC",
+  "MIT",
+  "Unicode-3.0",
+  "Unlicense",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

@@ -64,12 +64,6 @@ pub struct NodeDeletedEventResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct UnknownEventResponse {
-    #[serde(flatten)]
-    pub other: HashMap<String, json::Value>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "a")]
 pub enum EventResponseKind {
     /// One (or more) new nodes have been created.

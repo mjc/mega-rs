@@ -27,12 +27,18 @@ pub(crate) struct NodeAttributes {
 
 impl NodeAttributes {
     pub(crate) fn decrypt_and_unpack(file_key: &[u8; 16], buffer: &mut [u8]) -> Result<Self> {
+        if !buffer.len().is_multiple_of(16) {
+            return Err(crate::Error::InvalidNodeAttributesHeader);
+        }
+
         let mut cbc = cbc::Decryptor::<Aes128>::new(file_key.into(), &<_>::default());
-        for chunk in buffer.chunks_exact_mut(16) {
+        for chunk in buffer.as_chunks_mut::<16>().0 {
             cbc.decrypt_block_mut(chunk.into());
         }
 
-        assert_eq!(&buffer[..4], b"MEGA");
+        if buffer.len() < 4 || &buffer[..4] != b"MEGA" {
+            return Err(crate::Error::InvalidNodeAttributesHeader);
+        }
 
         let len = buffer.iter().take_while(|it| **it != b'\0').count();
         let attrs = json::from_slice(&buffer[4..len])?;
@@ -45,10 +51,10 @@ impl NodeAttributes {
         json::to_writer(&mut buffer, self)?;
 
         let padding_len = (16 - buffer.len() % 16) % 16;
-        buffer.extend(std::iter::repeat(b'\0').take(padding_len));
+        buffer.extend(std::iter::repeat_n(b'\0', padding_len));
 
         let mut cbc = cbc::Encryptor::<Aes128>::new(file_key.into(), &<_>::default());
-        for chunk in buffer.chunks_exact_mut(16) {
+        for chunk in buffer.as_chunks_mut::<16>().0 {
             cbc.encrypt_block_mut(chunk.into());
         }
 

@@ -39,7 +39,7 @@ async fn run(
         })
     };
 
-    mega.upload_thumbnail(&node, size, reader.compat()).await?;
+    mega.upload_thumbnail(node, size, reader.compat()).await?;
 
     bar.finish_with_message("thumbnail uploaded !");
 
@@ -57,7 +57,7 @@ async fn main() {
         panic!("expected 2 command-line arguments: {{distant_file_path}} {{thumbnail_file_path}}");
     };
 
-    let http_client = reqwest::Client::new();
+    let http_client = mega::http_client_builder().unwrap().build().unwrap();
     let mut mega = mega::Client::builder().build(http_client).unwrap();
 
     mega.login(&email, &password, mfa.as_deref()).await.unwrap();

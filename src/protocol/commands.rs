@@ -289,6 +289,8 @@ pub enum Request {
 /// Represents a response message from MEGA's API.
 ///
 /// Keep in mind that these message definitions have been somewhat reverse-engineered from MEGA's C++ SDK, and are, therefore, not complete.
+// Boxing the largest response would change the public wire-model API for no runtime benefit here.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Response {
     /// An error response.

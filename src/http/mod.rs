@@ -3,7 +3,9 @@ use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use futures::io::AsyncRead;
+use futures::stream::Stream;
 use secrecy::SecretBox;
 use url::Url;
 use zeroize::Zeroize;
@@ -14,6 +16,8 @@ mod reqwest;
 use crate::error::Result;
 use crate::protocol::commands::{Request, Response};
 use crate::utils::rsa::RsaPrivateKey;
+
+pub type HttpGetStream = Pin<Box<dyn Stream<Item = std::io::Result<Bytes>> + Send>>;
 
 /// Stores the data representing a user's session.
 #[derive(Debug, Clone, Zeroize)]
@@ -64,8 +68,13 @@ pub trait HttpClient: Send + Sync {
         query_params: &[(&str, &str)],
     ) -> Result<Vec<Response>>;
 
-    /// Initiates a simple GET request, returning the response body as a reader.
-    async fn get(&self, url: Url) -> Result<Pin<Box<dyn AsyncRead + Send>>>;
+    /// Initiates a simple GET request, returning the response body as byte chunks.
+    async fn get(&self, url: Url) -> Result<HttpGetStream>;
+
+    /// Initiates a simple GET request from an already formatted URL string.
+    async fn get_str(&self, url: &str) -> Result<HttpGetStream> {
+        self.get(Url::parse(url)?).await
+    }
 
     /// Initiates a simple POST request, with body and optional `content-length`, returning the response body as a reader.
     async fn post(

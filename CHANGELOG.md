@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Reworked TLS feature gating so the crate-level `rustls-tls`/`native-tls` flags explicitly pick the matching `reqwest` backend (rustls vs native) and documented how to opt in.
+
 ### Fixed
 
 ### Removed

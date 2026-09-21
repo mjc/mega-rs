@@ -6,10 +6,12 @@ use std::env;
 
 #[tokio::test]
 async fn public_url_fetch_test() {
-    let public_url =
-        env::var("MEGA_PUBLIC_URL").expect("missing MEGA_PUBLIC_URL environment variable");
+    let Ok(public_url) = env::var("MEGA_PUBLIC_URL") else {
+        eprintln!("skipping public_url_fetch_test: missing MEGA_PUBLIC_URL environment variable");
+        return;
+    };
 
-    let http_client = reqwest::Client::new();
+    let http_client = mega::http_client_builder().unwrap().build().unwrap();
     let mega = mega::Client::builder().build(http_client).unwrap();
 
     let _nodes = mega
