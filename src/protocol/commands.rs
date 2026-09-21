@@ -6,7 +6,7 @@ use serde::ser::SerializeSeq;
 use serde::{Deserialize, Serialize, Serializer};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 
-use crate::error::{ErrorCode, Result};
+use crate::error::{Error, ErrorCode, Result};
 
 /// Represents the kind of a given node.
 #[repr(u8)]
@@ -329,6 +329,26 @@ pub enum Response {
     UploadFileAttributes(UploadFileAttributesResponse),
     /// Response for the `Request::PutFileAttributes` message.
     PutFileAttributes(PutFileAttributesResponse),
+}
+
+impl Response {
+    /// Validates a response batch that must contain exactly one response.
+    ///
+    /// Non-success MEGA error responses are converted to [`Error`]. `Error(OK)`
+    /// is preserved because MEGA uses it as the successful response for
+    /// mutation requests.
+    pub(crate) fn into_single_result(mut responses: Vec<Self>) -> Result<Self> {
+        if responses.len() != 1 {
+            return Err(Error::InvalidResponseType);
+        }
+
+        let response = responses.pop().expect("response length checked above");
+        match response {
+            Self::Error(ErrorCode::OK) => Ok(Self::Error(ErrorCode::OK)),
+            Self::Error(code) => Err(Error::from(code)),
+            response => Ok(response),
+        }
+    }
 }
 
 /// Response for the `Request::PreLogin` message.
@@ -730,4 +750,41 @@ where
         seq.serialize_element(item.expose_secret())?;
     }
     seq.end()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_response_preserves_success_and_maps_mega_errors() {
+        assert_eq!(
+            Response::into_single_result(vec![Response::Error(ErrorCode::OK)]).unwrap(),
+            Response::Error(ErrorCode::OK)
+        );
+
+        let error = Response::into_single_result(vec![Response::Error(ErrorCode::EACCESS)])
+            .expect_err("non-success MEGA responses should become errors");
+        assert!(matches!(
+            error,
+            Error::MegaError {
+                code: ErrorCode::EACCESS
+            }
+        ));
+    }
+
+    #[test]
+    fn single_response_rejects_empty_and_multi_response_batches() {
+        assert!(matches!(
+            Response::into_single_result(Vec::new()),
+            Err(Error::InvalidResponseType)
+        ));
+        assert!(matches!(
+            Response::into_single_result(vec![
+                Response::Logout(LogoutResponse {}),
+                Response::Logout(LogoutResponse {}),
+            ]),
+            Err(Error::InvalidResponseType)
+        ));
+    }
 }

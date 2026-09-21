@@ -175,6 +175,14 @@ pub struct Client {
     pub(crate) client: Box<dyn HttpClient>,
 }
 
+struct DownloadContext {
+    aes_key: [u8; 16],
+    aes_iv: [u8; 8],
+    expected_mac: [u8; 8],
+    base_url: String,
+    size: u64,
+}
+
 assert_impl_all!(Client: Send, Sync);
 
 impl Client {
@@ -188,6 +196,25 @@ impl Client {
         self.client.send_requests(&self.state, requests, &[]).await
     }
 
+    /// Validates a node and prepares the shared state needed by each download backend.
+    async fn prepare_download(&self, node: &Node) -> Result<DownloadContext> {
+        if !node.kind.is_file() {
+            return Err(Error::NotAFileNode);
+        }
+
+        let aes_iv = node.aes_iv.ok_or(Error::MissingNodeAesIv)?;
+        let expected_mac = node.condensed_mac.ok_or(Error::MissingCondensedMac)?;
+        let (base_url, size) = self.get_download_url(node).await?;
+
+        Ok(DownloadContext {
+            aes_key: node.aes_key,
+            aes_iv,
+            expected_mac,
+            base_url,
+            size,
+        })
+    }
+
     /// Authenticates this session with MEGA.
     pub async fn login(&mut self, email: &str, password: &str, mfa: Option<&str>) -> Result<()> {
         let email = email.to_lowercase();
@@ -195,16 +222,9 @@ impl Client {
         let request = Request::PreLogin {
             user: email.clone().into(),
         };
-        let responses = self.send_requests(&[request]).await?;
-
-        let response = match responses.as_slice() {
-            [Response::PreLogin(response)] => response,
-            [Response::Error(code)] => {
-                return Err(Error::from(*code));
-            }
-            _ => {
-                return Err(Error::InvalidResponseType);
-            }
+        let response = match Response::into_single_result(self.send_requests(&[request]).await?)? {
+            Response::PreLogin(response) => response,
+            _ => return Err(Error::InvalidResponseType),
         };
 
         let (login_key, user_handle) = match (response.version, response.salt.as_ref()) {
@@ -259,16 +279,9 @@ impl Client {
             mfa: mfa.map(|it| it.to_string().into()),
             sek: Some(BASE64_URL_SAFE_NO_PAD.encode(sek).into()),
         };
-        let responses = self.send_requests(&[request]).await?;
-
-        let response = match responses.as_slice() {
-            [Response::Login(response)] => response,
-            [Response::Error(code)] => {
-                return Err(Error::from(*code));
-            }
-            _ => {
-                return Err(Error::InvalidResponseType);
-            }
+        let response = match Response::into_single_result(self.send_requests(&[request]).await?)? {
+            Response::Login(response) => response,
+            _ => return Err(Error::InvalidResponseType),
         };
 
         let key: [u8; 16] = {
@@ -352,19 +365,13 @@ impl Client {
             mfa: None,
             sek: Some(BASE64_URL_SAFE_NO_PAD.encode(sek).into()),
         };
-        let responses = self
-            .client
-            .send_requests(&self.state, &[request], &[("sid", sid.as_str())])
-            .await?;
-
-        let response = match responses.as_slice() {
-            [Response::Login(response)] => response,
-            [Response::Error(code)] => {
-                return Err(Error::from(*code));
-            }
-            _ => {
-                return Err(Error::InvalidResponseType);
-            }
+        let response = match Response::into_single_result(
+            self.client
+                .send_requests(&self.state, &[request], &[("sid", sid.as_str())])
+                .await?,
+        )? {
+            Response::Login(response) => response,
+            _ => return Err(Error::InvalidResponseType),
         };
 
         let sek: [u8; 16] = {
@@ -418,14 +425,11 @@ impl Client {
     /// Logs out of the current session with MEGA.
     pub async fn logout(&mut self) -> Result<()> {
         let request = Request::Logout {};
-        let responses = self.send_requests(&[request]).await?;
-
-        match responses.as_slice() {
-            [Response::Error(ErrorCode::OK)] => {
+        match Response::into_single_result(self.send_requests(&[request]).await?)? {
+            Response::Error(ErrorCode::OK) => {
                 self.state.session = None;
                 Ok(())
             }
-            [Response::Error(code)] => Err(Error::from(*code)),
             _ => Err(Error::InvalidResponseType),
         }
     }
@@ -463,16 +467,9 @@ impl Client {
     /// Get information about the current user.
     pub async fn get_current_user_info(&self) -> Result<UserInfo> {
         let request = Request::UserInfo { v: None };
-        let responses = self.send_requests(&[request]).await?;
-
-        let response = match responses.as_slice() {
-            [Response::UserInfo(response)] => response,
-            [Response::Error(code)] => {
-                return Err(Error::from(*code));
-            }
-            _ => {
-                return Err(Error::InvalidResponseType);
-            }
+        let response = match Response::into_single_result(self.send_requests(&[request]).await?)? {
+            Response::UserInfo(response) => response,
+            _ => return Err(Error::InvalidResponseType),
         };
 
         Ok(UserInfo {
@@ -509,16 +506,9 @@ impl Client {
     /// Lists the user's MEGA sessions.
     pub async fn list_sessions(&self) -> Result<Vec<SessionInfo>> {
         let request = Request::ListSessions { x: Some(1) };
-        let responses = self.send_requests(&[request]).await?;
-
-        let response = match responses.as_slice() {
-            [Response::ListSessions(response)] => response,
-            [Response::Error(code)] => {
-                return Err(Error::from(*code));
-            }
-            _ => {
-                return Err(Error::InvalidResponseType);
-            }
+        let response = match Response::into_single_result(self.send_requests(&[request]).await?)? {
+            Response::ListSessions(response) => response,
+            _ => return Err(Error::InvalidResponseType),
         };
 
         Ok(response.sessions.iter().map(SessionInfo::from).collect())
@@ -534,11 +524,8 @@ impl Client {
             ko: None,
             s: session_ids.into_iter().map(|it| it.into().into()).collect(),
         };
-        let responses = self.send_requests(&[request]).await?;
-
-        match responses.as_slice() {
-            [Response::Error(ErrorCode::OK)] => Ok(()),
-            [Response::Error(code)] => Err(Error::from(*code)),
+        match Response::into_single_result(self.send_requests(&[request]).await?)? {
+            Response::Error(ErrorCode::OK) => Ok(()),
             _ => Err(Error::InvalidResponseType),
         }
     }
@@ -553,11 +540,8 @@ impl Client {
             ko: Some(1),
             s: Vec::default(),
         };
-        let responses = self.send_requests(&[request]).await?;
-
-        match responses.as_slice() {
-            [Response::Error(ErrorCode::OK)] => Ok(()),
-            [Response::Error(code)] => Err(Error::from(*code)),
+        match Response::into_single_result(self.send_requests(&[request]).await?)? {
+            Response::Error(ErrorCode::OK) => Ok(()),
             _ => Err(Error::InvalidResponseType),
         }
     }
@@ -875,17 +859,11 @@ impl Client {
                     p: Some(node_id.to_string().into()),
                     n: None,
                 };
-                let responses = self.send_requests(&[request]).await?;
-
-                let file = match responses.as_slice() {
-                    [Response::Download(file)] => file,
-                    [Response::Error(code)] => {
-                        return Err(Error::from(*code));
-                    }
-                    _ => {
-                        return Err(Error::InvalidResponseType);
-                    }
-                };
+                let file =
+                    match Response::into_single_result(self.send_requests(&[request]).await?)? {
+                        Response::Download(file) => file,
+                        _ => return Err(Error::InvalidResponseType),
+                    };
 
                 // TODO: MEGA includes in its web client a check to see if both halves of `file_key`
                 //       are identical to each other. This is apparently done to prevent an attacker from
@@ -955,19 +933,13 @@ impl Client {
             }
             NodeKind::Folder => {
                 let request = Request::FetchNodes { c: 1, r: Some(1) };
-                let responses = self
-                    .client
-                    .send_requests(&self.state, &[request], &[("n", node_id)])
-                    .await?;
-
-                let files = match responses.as_slice() {
-                    [Response::FetchNodes(files)] => files,
-                    [Response::Error(code)] => {
-                        return Err(Error::from(*code));
-                    }
-                    _ => {
-                        return Err(Error::InvalidResponseType);
-                    }
+                let files = match Response::into_single_result(
+                    self.client
+                        .send_requests(&self.state, &[request], &[("n", node_id)])
+                        .await?,
+                )? {
+                    Response::FetchNodes(files) => files,
+                    _ => return Err(Error::InvalidResponseType),
                 };
 
                 for file in &files.nodes {
@@ -1122,11 +1094,11 @@ impl Client {
 
     /// Returns the status of the current storage quotas.
     pub async fn get_storage_quotas(&self) -> Result<StorageQuotas> {
-        let responses = self
-            .send_requests(&[Request::Quota { xfer: 1, strg: 1 }])
-            .await?;
-
-        let [Response::Quota(quota)] = responses.as_slice() else {
+        let Response::Quota(quota) = Response::into_single_result(
+            self.send_requests(&[Request::Quota { xfer: 1, strg: 1 }])
+                .await?,
+        )?
+        else {
             return Err(Error::InvalidResponseType);
         };
 
@@ -1138,7 +1110,7 @@ impl Client {
 
     /// Fetches the download URL and server-reported size for a node from MEGA's servers.
     async fn get_download_url(&self, node: &Node) -> Result<(String, u64)> {
-        let responses = if let Some(download_id) = node.download_id() {
+        let response = if let Some(download_id) = node.download_id() {
             let request = if node.handle.as_str() == download_id {
                 Request::Download {
                     g: 1,
@@ -1155,9 +1127,11 @@ impl Client {
                 }
             };
 
-            self.client
-                .send_requests(&self.state, &[request], &[("n", download_id)])
-                .await?
+            Response::into_single_result(
+                self.client
+                    .send_requests(&self.state, &[request], &[("n", download_id)])
+                    .await?,
+            )?
         } else {
             let request = Request::Download {
                 g: 1,
@@ -1166,12 +1140,11 @@ impl Client {
                 n: Some(node.handle.clone().into()),
             };
 
-            self.send_requests(&[request]).await?
+            Response::into_single_result(self.send_requests(&[request]).await?)?
         };
 
-        match responses.as_slice() {
-            [Response::Download(response)] => Ok((response.download_url.clone(), response.size)),
-            [Response::Error(code)] => Err(Error::from(*code)),
+        match response {
+            Response::Download(response) => Ok((response.download_url, response.size)),
             _ => Err(Error::InvalidResponseType),
         }
     }
@@ -1206,27 +1179,21 @@ impl Client {
         writer: W,
         progress: Option<Arc<dyn Fn(u64) + Send + Sync>>,
     ) -> Result<()> {
-        if !node.kind.is_file() {
-            return Err(Error::NotAFileNode);
-        }
-
-        let aes_iv = node.aes_iv.ok_or(Error::MissingNodeAesIv)?;
-        let expected_mac = node.condensed_mac.ok_or(Error::MissingCondensedMac)?;
-
-        let (base_url, server_size) = self.get_download_url(node).await?;
-        let size = server_size;
+        let DownloadContext {
+            aes_key,
+            aes_iv,
+            expected_mac,
+            base_url,
+            size,
+        } = self.prepare_download(node).await?;
         // Use inclusive end range (MEGA API expects end byte inclusive), or early return for empty files
         if size == 0 {
             if let Some(cb) = progress {
                 cb(0);
             }
-            let empty_mac = fingerprint::compute_condensed_mac(
-                Cursor::new(Vec::new()),
-                0,
-                &node.aes_key,
-                &aes_iv,
-            )
-            .await?;
+            let empty_mac =
+                fingerprint::compute_condensed_mac(Cursor::new(Vec::new()), 0, &aes_key, &aes_iv)
+                    .await?;
             if empty_mac != expected_mac {
                 return Err(Error::CondensedMacMismatch);
             }
@@ -1239,7 +1206,7 @@ impl Client {
         let mut file_iv = [0u8; 16];
 
         file_iv[..8].copy_from_slice(&aes_iv);
-        let mut ctr = ctr::Ctr128BE::<Aes128>::new(node.aes_key[..].into(), (&file_iv).into());
+        let mut ctr = ctr::Ctr128BE::<Aes128>::new(aes_key[..].into(), (&file_iv).into());
 
         let (condensed_mac_reader, condensed_mac_writer) = sluice::pipe::pipe();
 
@@ -1293,7 +1260,6 @@ impl Client {
         };
 
         let condensed_mac_future = {
-            let aes_key = node.aes_key;
             async move {
                 fingerprint::compute_condensed_mac(condensed_mac_reader, size, &aes_key, &aes_iv)
                     .await
@@ -1367,26 +1333,19 @@ impl Client {
         W: tokio::io::AsyncWrite + tokio::io::AsyncSeek + Unpin + Send + 'static,
         F: Fn(u64) + Send + Sync + 'static,
     {
-        if !node.kind.is_file() {
-            return Err(Error::NotAFileNode);
-        }
-
-        let aes_iv = node.aes_iv.ok_or(Error::MissingNodeAesIv)?;
-        let expected_mac = node.condensed_mac.ok_or(Error::MissingCondensedMac)?;
-
-        let (base_url, server_size) = self.get_download_url(node).await?;
+        let context = self.prepare_download(node).await?;
         let progress = progress.map(|cb| Arc::new(cb) as Arc<dyn Fn(u64) + Send + Sync>);
         parallel::download_parallel(
             &*self.client,
             node,
-            base_url,
-            server_size,
+            context.base_url,
+            context.size,
             writer,
             num_connections,
             None,
             progress,
-            aes_iv,
-            expected_mac,
+            context.aes_iv,
+            context.expected_mac,
         )
         .await
     }
@@ -1402,28 +1361,21 @@ impl Client {
     where
         F: Fn(u64) + Send + Sync + 'static,
     {
-        if !node.kind.is_file() {
-            return Err(Error::NotAFileNode);
-        }
-
-        let aes_iv = node.aes_iv.ok_or(Error::MissingNodeAesIv)?;
-        let expected_mac = node.condensed_mac.ok_or(Error::MissingCondensedMac)?;
-
-        let (base_url, server_size) = self.get_download_url(node).await?;
+        let context = self.prepare_download(node).await?;
         let progress = progress.map(|cb| Arc::new(cb) as Arc<dyn Fn(u64) + Send + Sync>);
         parallel::download_parallel_resumable_to_file(
             &*self.client,
             node,
-            base_url,
-            server_size,
+            context.base_url,
+            context.size,
             writer,
             num_connections,
             None,
             progress,
             None,
             None,
-            aes_iv,
-            expected_mac,
+            context.aes_iv,
+            context.expected_mac,
         )
         .await
     }
@@ -1453,14 +1405,7 @@ impl Client {
         F: Fn(u64) + Send + Sync + 'static,
         C: Fn(u32, [u8; 16]) + Send + Sync + 'static,
     {
-        if !node.kind.is_file() {
-            return Err(Error::NotAFileNode);
-        }
-
-        let aes_iv = node.aes_iv.ok_or(Error::MissingNodeAesIv)?;
-        let expected_mac = node.condensed_mac.ok_or(Error::MissingCondensedMac)?;
-
-        let (base_url, server_size) = self.get_download_url(node).await?;
+        let context = self.prepare_download(node).await?;
         let progress = progress.map(|cb| Arc::new(cb) as Arc<dyn Fn(u64) + Send + Sync>);
         let trusted_chunks: Arc<[Option<[u8; 16]>]> = trusted_chunks.to_vec().into();
         let chunk_verified =
@@ -1468,16 +1413,16 @@ impl Client {
         parallel::download_parallel_resumable(
             &*self.client,
             node,
-            base_url,
-            server_size,
+            context.base_url,
+            context.size,
             writer,
             num_connections,
             max_chunks_per_request,
             progress,
             Some(trusted_chunks),
             chunk_verified,
-            aes_iv,
-            expected_mac,
+            context.aes_iv,
+            context.expected_mac,
         )
         .await
     }
@@ -1495,26 +1440,19 @@ impl Client {
     where
         W: ParallelDownloadWriter + 'static,
     {
-        if !node.kind.is_file() {
-            return Err(Error::NotAFileNode);
-        }
-
-        let aes_iv = node.aes_iv.ok_or(Error::MissingNodeAesIv)?;
-        let expected_mac = node.condensed_mac.ok_or(Error::MissingCondensedMac)?;
-
-        let (base_url, server_size) = self.get_download_url(node).await?;
+        let context = self.prepare_download(node).await?;
         parallel::download_parallel_resumable_with_callbacks(
             &*self.client,
             node,
-            base_url,
-            server_size,
+            context.base_url,
+            context.size,
             writer,
             num_connections,
             max_chunks_per_request,
             Some(trusted_chunks),
             callbacks,
-            aes_iv,
-            expected_mac,
+            context.aes_iv,
+            context.expected_mac,
         )
         .await
     }
@@ -1535,14 +1473,7 @@ impl Client {
         F: Fn(u64) + Send + Sync + 'static,
         C: Fn(u32, [u8; 16]) + Send + Sync + 'static,
     {
-        if !node.kind.is_file() {
-            return Err(Error::NotAFileNode);
-        }
-
-        let aes_iv = node.aes_iv.ok_or(Error::MissingNodeAesIv)?;
-        let expected_mac = node.condensed_mac.ok_or(Error::MissingCondensedMac)?;
-
-        let (base_url, server_size) = self.get_download_url(node).await?;
+        let context = self.prepare_download(node).await?;
         let progress = progress.map(|cb| Arc::new(cb) as Arc<dyn Fn(u64) + Send + Sync>);
         let trusted_chunks: Arc<[Option<[u8; 16]>]> = trusted_chunks.to_vec().into();
         let chunk_verified =
@@ -1550,16 +1481,16 @@ impl Client {
         parallel::download_parallel_resumable_to_file(
             &*self.client,
             node,
-            base_url,
-            server_size,
+            context.base_url,
+            context.size,
             writer,
             num_connections,
             max_chunks_per_request,
             progress,
             Some(trusted_chunks),
             chunk_verified,
-            aes_iv,
-            expected_mac,
+            context.aes_iv,
+            context.expected_mac,
         )
         .await
     }
@@ -1574,26 +1505,19 @@ impl Client {
         trusted_chunks: Arc<[Option<[u8; 16]>]>,
         callbacks: Option<Arc<dyn ParallelDownloadCallbacks>>,
     ) -> Result<()> {
-        if !node.kind.is_file() {
-            return Err(Error::NotAFileNode);
-        }
-
-        let aes_iv = node.aes_iv.ok_or(Error::MissingNodeAesIv)?;
-        let expected_mac = node.condensed_mac.ok_or(Error::MissingCondensedMac)?;
-
-        let (base_url, server_size) = self.get_download_url(node).await?;
+        let context = self.prepare_download(node).await?;
         parallel::download_parallel_resumable_to_file_with_callbacks(
             &*self.client,
             node,
-            base_url,
-            server_size,
+            context.base_url,
+            context.size,
             writer,
             num_connections,
             max_chunks_per_request,
             Some(trusted_chunks),
             callbacks,
-            aes_iv,
-            expected_mac,
+            context.aes_iv,
+            context.expected_mac,
         )
         .await
     }
@@ -1618,16 +1542,9 @@ impl Client {
             s: size,
             ssl: if self.state.https { 2 } else { 0 },
         };
-        let responses = self.send_requests(&[request]).await?;
-
-        let response = match responses.as_slice() {
-            [Response::Upload(response)] => response,
-            [Response::Error(code)] => {
-                return Err(Error::from(*code));
-            }
-            _ => {
-                return Err(Error::InvalidResponseType);
-            }
+        let response = match Response::into_single_result(self.send_requests(&[request]).await?)? {
+            Response::Upload(response) => response,
+            _ => return Err(Error::InvalidResponseType),
         };
 
         let (aes_key, aes_iv_seed): ([u8; 16], [u8; 8]) = rand::random();
@@ -1751,16 +1668,9 @@ impl Client {
             i: idempotence_id,
         };
 
-        let responses = self.send_requests(&[request]).await?;
-
-        match responses.as_slice() {
-            [Response::UploadComplete(_)] => {}
-            [Response::Error(code)] => {
-                return Err(Error::from(*code));
-            }
-            _ => {
-                return Err(Error::InvalidResponseType);
-            }
+        match Response::into_single_result(self.send_requests(&[request]).await?)? {
+            Response::UploadComplete(_) => {}
+            _ => return Err(Error::InvalidResponseType),
         };
 
         Ok(())
@@ -1781,9 +1691,9 @@ impl Client {
             ssl: if self.state.https { 2 } else { 0 },
             r: Some(1),
         };
-        let responses = self.send_requests(&[request]).await?;
-
-        let [Response::UploadFileAttributes(response)] = responses.as_slice() else {
+        let Response::UploadFileAttributes(response) =
+            Response::into_single_result(self.send_requests(&[request]).await?)?
+        else {
             return Err(Error::InvalidResponseType);
         };
 
@@ -1881,9 +1791,9 @@ impl Client {
             ssl: if self.state.https { 2 } else { 0 },
             r: None,
         };
-        let responses = self.send_requests(&[request]).await?;
-
-        let [Response::UploadFileAttributes(response)] = responses.as_slice() else {
+        let Response::UploadFileAttributes(response) =
+            Response::into_single_result(self.send_requests(&[request]).await?)?
+        else {
             return Err(Error::InvalidResponseType);
         };
 
@@ -1935,16 +1845,9 @@ impl Client {
             n: node.handle.clone().into(),
             fa: format!("{0}*{fah}", u8::from(kind)),
         };
-        let responses = self.send_requests(&[request]).await?;
-
-        match responses.as_slice() {
-            [Response::PutFileAttributes(_)] => {}
-            [Response::Error(code)] => {
-                return Err(Error::from(*code));
-            }
-            _ => {
-                return Err(Error::InvalidResponseType);
-            }
+        match Response::into_single_result(self.send_requests(&[request]).await?)? {
+            Response::PutFileAttributes(_) => {}
+            _ => return Err(Error::InvalidResponseType),
         }
 
         Ok(())
@@ -2015,16 +1918,9 @@ impl Client {
             i: idempotence_id,
         };
 
-        let responses = self.send_requests(&[request]).await?;
-
-        match responses.as_slice() {
-            [Response::UploadComplete(_)] => {}
-            [Response::Error(code)] => {
-                return Err(Error::from(*code));
-            }
-            _ => {
-                return Err(Error::InvalidResponseType);
-            }
+        match Response::into_single_result(self.send_requests(&[request]).await?)? {
+            Response::UploadComplete(_) => {}
+            _ => return Err(Error::InvalidResponseType),
         };
 
         Ok(())
@@ -2060,16 +1956,9 @@ impl Client {
             i: idempotence_id,
         };
 
-        let responses = self.send_requests(&[request]).await?;
-
-        match responses.as_slice() {
-            [Response::Error(ErrorCode::OK)] => {}
-            [Response::Error(code)] => {
-                return Err(Error::from(*code));
-            }
-            _ => {
-                return Err(Error::InvalidResponseType);
-            }
+        match Response::into_single_result(self.send_requests(&[request]).await?)? {
+            Response::Error(ErrorCode::OK) => {}
+            _ => return Err(Error::InvalidResponseType),
         }
 
         Ok(())
@@ -2085,16 +1974,9 @@ impl Client {
             i: idempotence_id,
         };
 
-        let responses = self.send_requests(&[request]).await?;
-
-        match responses.as_slice() {
-            [Response::Error(ErrorCode::OK)] => {}
-            [Response::Error(code)] => {
-                return Err(Error::from(*code));
-            }
-            _ => {
-                return Err(Error::InvalidResponseType);
-            }
+        match Response::into_single_result(self.send_requests(&[request]).await?)? {
+            Response::Error(ErrorCode::OK) => {}
+            _ => return Err(Error::InvalidResponseType),
         }
 
         Ok(())
@@ -2109,16 +1991,9 @@ impl Client {
             i: idempotence_id,
         };
 
-        let responses = self.send_requests(&[request]).await?;
-
-        match responses.as_slice() {
-            [Response::Error(ErrorCode::OK)] => {}
-            [Response::Error(code)] => {
-                return Err(Error::from(*code));
-            }
-            _ => {
-                return Err(Error::InvalidResponseType);
-            }
+        match Response::into_single_result(self.send_requests(&[request]).await?)? {
+            Response::Error(ErrorCode::OK) => {}
+            _ => return Err(Error::InvalidResponseType),
         }
 
         Ok(())
