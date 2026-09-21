@@ -14,7 +14,6 @@ allow = [
   "BSL-1.0",
   "CDLA-Permissive-2.0",
   "ISC",
-  "LGPL-2.1-or-later",
   "MIT",
   "Unicode-3.0",
   "Unlicense",
