@@ -26,6 +26,7 @@ mod http;
 mod parallel;
 mod protocol;
 mod sessions;
+mod types;
 mod utils;
 
 pub use crate::error::{Error, ErrorCode, Result};
@@ -38,9 +39,10 @@ pub use crate::fingerprint::{
     MegaChunkBoundaries, MegaChunkMac, MegaCondensedMac, ParallelMacProcessor,
 };
 #[cfg(feature = "parallel")]
-pub use crate::parallel::{ParallelDownloadCallbacks, ParallelDownloadWriter};
+pub use crate::parallel::{ParallelDownloadCallbacks, ParallelDownloadWriter, TrustedChunkPlan};
 pub use crate::protocol::commands::{FileNode, NodeKind};
 pub use crate::sessions::SessionInfo;
+pub use crate::types::{ByteRange, FileSize, PublicLink, TransferUrl};
 pub use crate::utils::StorageQuotas;
 
 use crate::attributes::NodeAttributes;
@@ -49,6 +51,7 @@ use crate::http::{ClientState, HttpClient, UserSession};
 use crate::protocol::commands::{Request, Response, UploadAttributes};
 use crate::protocol::events::{EventBatchResponse, EventResponse, EventResponseKind};
 use crate::protocol::{FILE_KEY_SIZE, FOLDER_KEY_SIZE, USER_KEY_SIZE, USER_SID_SIZE};
+use crate::types::{SessionExchangeKey, SessionId, SessionKey, UserHandle};
 use crate::utils::rsa::RsaPrivateKey;
 
 pub(crate) const DEFAULT_API_ORIGIN: &str = "https://g.api.mega.co.nz/";
@@ -179,8 +182,8 @@ struct DownloadContext {
     aes_key: [u8; 16],
     aes_iv: [u8; 8],
     expected_mac: [u8; 8],
-    base_url: String,
-    size: u64,
+    base_url: TransferUrl,
+    size: FileSize,
 }
 
 assert_impl_all!(Client: Send, Sync);
@@ -270,33 +273,33 @@ impl Client {
             }
         };
 
-        let sek: [u8; 16] = rand::random();
+        let sek = SessionExchangeKey::new(rand::random());
 
         let request = Request::Login {
             user: Some(email.clone().into()),
             user_handle: Some(user_handle.clone().into()),
             si: None,
             mfa: mfa.map(|it| it.to_string().into()),
-            sek: Some(BASE64_URL_SAFE_NO_PAD.encode(sek).into()),
+            sek: Some(BASE64_URL_SAFE_NO_PAD.encode(sek.as_bytes()).into()),
         };
         let response = match Response::into_single_result(self.send_requests(&[request]).await?)? {
             Response::Login(response) => response,
             _ => return Err(Error::InvalidResponseType),
         };
 
-        let key: [u8; 16] = {
+        let key = {
             let key = (response.key.as_ref())
                 .ok_or_else(|| Error::MissingResponseField { field: "k" })?;
             let mut key = BASE64_URL_SAFE_NO_PAD.decode(key)?;
             utils::decrypt_ebc_in_place(&login_key, &mut key);
-            key.try_into().map_err(|_| Error::InvalidResponseFormat)?
+            SessionKey::new(key.try_into().map_err(|_| Error::InvalidResponseFormat)?)
         };
 
-        let sek: [u8; 16] = {
+        let sek = {
             let sek = (response.sek.as_ref())
                 .ok_or_else(|| Error::MissingResponseField { field: "sek" })?;
             let sek = BASE64_URL_SAFE_NO_PAD.decode(sek)?;
-            sek.try_into().map_err(|_| Error::InvalidResponseFormat)?
+            SessionExchangeKey::new(sek.try_into().map_err(|_| Error::InvalidResponseFormat)?)
         };
 
         let csid = {
@@ -307,7 +310,7 @@ impl Client {
 
         let privk = {
             let mut privk = BASE64_URL_SAFE_NO_PAD.decode(&response.privk)?;
-            utils::decrypt_ebc_in_place(&key, &mut privk);
+            utils::decrypt_ebc_in_place(key.as_bytes(), &mut privk);
             RsaPrivateKey::from_mpi_bytes(&privk)?
         };
 
@@ -321,10 +324,10 @@ impl Client {
         };
 
         self.state.session = Some(SecretBox::new(Box::new(UserSession {
-            sid,
+            sid: SessionId::new(sid),
             key,
             sek,
-            user_handle: response.u.clone(),
+            user_handle: UserHandle::new(response.u.clone()),
             privk,
         })));
 
@@ -353,17 +356,17 @@ impl Client {
 
         let (key, sid) = session[1..].split_at(16);
 
-        let mut key: [u8; 16] = key.try_into().unwrap();
-        let sid = BASE64_URL_SAFE_NO_PAD.encode(sid);
+        let key = SessionKey::new(key.try_into().unwrap());
+        let sid = SessionId::new(BASE64_URL_SAFE_NO_PAD.encode(sid));
 
-        let sek: [u8; 16] = rand::random();
+        let sek = SessionExchangeKey::new(rand::random());
 
         let request = Request::Login {
             user: None,
             user_handle: None,
             si: None,
             mfa: None,
-            sek: Some(BASE64_URL_SAFE_NO_PAD.encode(sek).into()),
+            sek: Some(BASE64_URL_SAFE_NO_PAD.encode(sek.as_bytes()).into()),
         };
         let response = match Response::into_single_result(
             self.client
@@ -374,18 +377,20 @@ impl Client {
             _ => return Err(Error::InvalidResponseType),
         };
 
-        let sek: [u8; 16] = {
+        let sek = {
             let sek = (response.sek.as_ref())
                 .ok_or_else(|| Error::MissingResponseField { field: "sek" })?;
             let sek = BASE64_URL_SAFE_NO_PAD.decode(sek)?;
-            sek.try_into().map_err(|_| Error::InvalidResponseFormat)?
+            SessionExchangeKey::new(sek.try_into().map_err(|_| Error::InvalidResponseFormat)?)
         };
 
-        utils::decrypt_ebc_in_place(&sek, &mut key);
+        let mut key_bytes = key.into_bytes();
+        utils::decrypt_ebc_in_place(sek.as_bytes(), &mut key_bytes);
+        let key = SessionKey::new(key_bytes);
 
         let privk = {
             let mut privk = BASE64_URL_SAFE_NO_PAD.decode(&response.privk)?;
-            utils::decrypt_ebc_in_place(&key, &mut privk);
+            utils::decrypt_ebc_in_place(key.as_bytes(), &mut privk);
             RsaPrivateKey::from_mpi_bytes(&privk)?
         };
 
@@ -394,7 +399,7 @@ impl Client {
             key,
             sek,
             privk,
-            user_handle: response.u.clone(),
+            user_handle: UserHandle::new(response.u.clone()),
         })));
 
         Ok(())
@@ -412,11 +417,11 @@ impl Client {
         let mut serialized: Vec<u8> = Vec::with_capacity(1 + USER_KEY_SIZE + USER_SID_SIZE);
         serialized.push(1);
 
-        let mut key = session.key;
-        utils::encrypt_ebc_in_place(&session.sek, &mut key);
+        let mut key = session.key.into_bytes();
+        utils::encrypt_ebc_in_place(session.sek.as_bytes(), &mut key);
         serialized.extend(key);
 
-        let mut sid = BASE64_URL_SAFE_NO_PAD.decode(&session.sid)?;
+        let mut sid = BASE64_URL_SAFE_NO_PAD.decode(session.sid.as_str())?;
         serialized.append(&mut sid);
 
         Ok(BASE64_URL_SAFE_NO_PAD.encode(serialized))
@@ -557,7 +562,7 @@ impl Client {
 
         let request_1 = Request::FetchNodes { c: 1, r: None };
         let request_2 = Request::UserAttributes {
-            user_handle: session.user_handle.clone().into(),
+            user_handle: session.user_handle.as_str().to_string().into(),
             attribute: "^!keys".to_string(),
             v: 1,
         };
@@ -654,9 +659,9 @@ impl Client {
                         //       }
                         //       ```
 
-                        if file_user == session.user_handle {
+                        if file_user == session.user_handle.as_str() {
                             // regular owned file or folder
-                            utils::decrypt_ebc_in_place(&session.key, &mut file_key);
+                            utils::decrypt_ebc_in_place(session.key.as_bytes(), &mut file_key);
                             return Some(file_key);
                         }
 
@@ -825,12 +830,16 @@ impl Client {
     /// - https://mega.nz/folder/{node_id}#{node_key}
     #[allow(rustdoc::bare_urls)]
     pub async fn fetch_public_nodes(&self, url: &str) -> Result<Nodes> {
-        let payload = match url.strip_prefix("https://mega.nz/") {
-            Some(payload) => payload,
-            None => {
-                return Err(Error::InvalidPublicUrlFormat);
-            }
-        };
+        let url = PublicLink::parse(url)?;
+        self.fetch_public_nodes_from_link(&url).await
+    }
+
+    /// Fetches all nodes from a validated public MEGA link.
+    pub async fn fetch_public_nodes_from_link(&self, url: &PublicLink) -> Result<Nodes> {
+        let payload = url
+            .as_str()
+            .strip_prefix("https://mega.nz/")
+            .ok_or(Error::InvalidPublicUrlFormat)?;
 
         let (node_kind, payload) = match payload.split_once("/") {
             Some(("file", payload)) => (NodeKind::File, payload),
@@ -1109,7 +1118,7 @@ impl Client {
     }
 
     /// Fetches the download URL and server-reported size for a node from MEGA's servers.
-    async fn get_download_url(&self, node: &Node) -> Result<(String, u64)> {
+    async fn get_download_url(&self, node: &Node) -> Result<(TransferUrl, FileSize)> {
         let response = if let Some(download_id) = node.download_id() {
             let request = if node.handle.as_str() == download_id {
                 Request::Download {
@@ -1144,7 +1153,10 @@ impl Client {
         };
 
         match response {
-            Response::Download(response) => Ok((response.download_url, response.size)),
+            Response::Download(response) => Ok((
+                TransferUrl::try_from(response.download_url)?,
+                FileSize::new(response.size),
+            )),
             _ => Err(Error::InvalidResponseType),
         }
     }
@@ -1187,7 +1199,7 @@ impl Client {
             size,
         } = self.prepare_download(node).await?;
         // Use inclusive end range (MEGA API expects end byte inclusive), or early return for empty files
-        if size == 0 {
+        if size.is_empty() {
             if let Some(cb) = progress {
                 cb(0);
             }
@@ -1199,7 +1211,7 @@ impl Client {
             }
             return Ok(());
         }
-        let url = Url::parse(&format!("{base_url}/0-{}", size - 1))?;
+        let url = base_url.for_range(size.range().expect("non-empty size has a range"));
 
         let mut body = self.client.get(url).await?;
 
@@ -1227,11 +1239,12 @@ impl Client {
                                 "download body length overflowed u64",
                             ))
                         })?;
-                if next_total > size {
+                if next_total > size.bytes() {
                     return Err(Error::from(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!(
-                            "download body exceeded expected length: expected {size} bytes, got at least {next_total} bytes"
+                            "download body exceeded expected length: expected {} bytes, got at least {next_total} bytes",
+                            size.bytes()
                         ),
                     )));
                 }
@@ -1247,11 +1260,12 @@ impl Client {
                 }
             }
 
-            if total_written != size {
+            if total_written != size.bytes() {
                 return Err(Error::from(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
                     format!(
-                        "unexpected EOF while reading download body: expected {size} bytes, got {total_written} bytes"
+                        "unexpected EOF while reading download body: expected {} bytes, got {total_written} bytes",
+                        size.bytes()
                     ),
                 )));
             }
@@ -1261,8 +1275,13 @@ impl Client {
 
         let condensed_mac_future = {
             async move {
-                fingerprint::compute_condensed_mac(condensed_mac_reader, size, &aes_key, &aes_iv)
-                    .await
+                fingerprint::compute_condensed_mac(
+                    condensed_mac_reader,
+                    size.bytes(),
+                    &aes_key,
+                    &aes_iv,
+                )
+                .await
             }
         };
 
@@ -1338,8 +1357,8 @@ impl Client {
         parallel::download_parallel(
             &*self.client,
             node,
-            context.base_url,
-            context.size,
+            context.base_url.to_string(),
+            context.size.bytes(),
             writer,
             num_connections,
             None,
@@ -1366,8 +1385,8 @@ impl Client {
         parallel::download_parallel_resumable_to_file(
             &*self.client,
             node,
-            context.base_url,
-            context.size,
+            context.base_url.to_string(),
+            context.size.bytes(),
             writer,
             num_connections,
             None,
@@ -1413,8 +1432,8 @@ impl Client {
         parallel::download_parallel_resumable(
             &*self.client,
             node,
-            context.base_url,
-            context.size,
+            context.base_url.to_string(),
+            context.size.bytes(),
             writer,
             num_connections,
             max_chunks_per_request,
@@ -1444,8 +1463,8 @@ impl Client {
         parallel::download_parallel_resumable_with_callbacks(
             &*self.client,
             node,
-            context.base_url,
-            context.size,
+            context.base_url.to_string(),
+            context.size.bytes(),
             writer,
             num_connections,
             max_chunks_per_request,
@@ -1481,8 +1500,8 @@ impl Client {
         parallel::download_parallel_resumable_to_file(
             &*self.client,
             node,
-            context.base_url,
-            context.size,
+            context.base_url.to_string(),
+            context.size.bytes(),
             writer,
             num_connections,
             max_chunks_per_request,
@@ -1509,8 +1528,8 @@ impl Client {
         parallel::download_parallel_resumable_to_file_with_callbacks(
             &*self.client,
             node,
-            context.base_url,
-            context.size,
+            context.base_url.to_string(),
+            context.size.bytes(),
             writer,
             num_connections,
             max_chunks_per_request,
@@ -1648,7 +1667,7 @@ impl Client {
         key[24..].copy_from_slice(&condensed_mac);
         utils::merge_key_mac(&mut key);
 
-        utils::encrypt_ebc_in_place(&session.key, &mut key);
+        utils::encrypt_ebc_in_place(session.key.as_bytes(), &mut key);
 
         let key_b64 = BASE64_URL_SAFE_NO_PAD.encode(key);
 
@@ -1898,7 +1917,7 @@ impl Client {
             BASE64_URL_SAFE_NO_PAD.encode(&buffer)
         };
 
-        utils::encrypt_ebc_in_place(&session.key, &mut aes_key);
+        utils::encrypt_ebc_in_place(session.key.as_bytes(), &mut aes_key);
 
         let key_b64 = BASE64_URL_SAFE_NO_PAD.encode(aes_key);
 
@@ -2343,9 +2362,9 @@ fn construct_event_node(
                     utils::decrypt_ebc_in_place(node.aes_key(), &mut file_key);
                     Some(file_key)
                 } else {
-                    if file_user == session.user_handle {
+                    if file_user == session.user_handle.as_str() {
                         // regular owned file or folder
-                        utils::decrypt_ebc_in_place(&session.key, &mut file_key);
+                        utils::decrypt_ebc_in_place(session.key.as_bytes(), &mut file_key);
                         return Some(file_key);
                     }
 

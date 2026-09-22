@@ -15,6 +15,7 @@ mod reqwest;
 
 use crate::error::Result;
 use crate::protocol::commands::{Request, Response};
+use crate::types::{SessionExchangeKey, SessionId, SessionKey, UserHandle};
 use crate::utils::rsa::RsaPrivateKey;
 
 pub type HttpGetStream = Pin<Box<dyn Stream<Item = std::io::Result<Bytes>> + Send>>;
@@ -23,15 +24,15 @@ pub type HttpGetStream = Pin<Box<dyn Stream<Item = std::io::Result<Bytes>> + Sen
 #[derive(Debug, Clone, Zeroize)]
 pub struct UserSession {
     /// The user's session id.
-    pub(crate) sid: String,
+    pub(crate) sid: SessionId,
     /// The user's master key.
-    pub(crate) key: [u8; 16],
+    pub(crate) key: SessionKey,
     /// The user's `sek`.
-    pub(crate) sek: [u8; 16],
+    pub(crate) sek: SessionExchangeKey,
     /// The user's RSA private key (used for shares).
     pub(crate) privk: RsaPrivateKey,
     /// The user's handle.
-    pub(crate) user_handle: String,
+    pub(crate) user_handle: UserHandle,
 }
 
 /// Stores the data representing the client's state.

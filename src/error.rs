@@ -71,6 +71,14 @@ pub enum Error {
     /// Requested too many parallel download workers.
     #[error("requested parallel download worker count exceeds the maximum allowed")]
     ParallelismTooHigh,
+    /// The supplied resumable chunk plan does not match the downloaded file.
+    #[error("trusted chunk plan has {actual} entries, but the file requires exactly {expected}")]
+    InvalidTrustedChunkPlan {
+        /// Number of MEGA chunks required by the file size.
+        expected: usize,
+        /// Number of entries supplied by the caller.
+        actual: usize,
+    },
     /// Node is not a file (e.g., attempting to download a folder).
     #[error("node is not a file")]
     NotAFileNode,

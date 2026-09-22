@@ -5,7 +5,6 @@
 //! - Processor (single): decrypt, write, update MAC
 //! - Uses ParallelMacProcessor for out-of-order MAC computation
 
-use std::fmt::Write as _;
 use std::fs::File as StdFile;
 use std::io;
 use std::io::SeekFrom;
@@ -28,6 +27,7 @@ use crate::fingerprint::{
     ParallelMacProcessor,
 };
 use crate::http::HttpClient;
+use crate::types::{ByteRange, FileSize, TransferUrl};
 use crate::Node;
 
 /// Maximum number of workers we will spawn to keep RAM bounded.
@@ -36,6 +36,32 @@ const MAX_PARALLEL_WORKERS: usize = 16;
 const DEFAULT_MAX_MEGA_CHUNKS_PER_REQUEST: usize = 2;
 /// Runtime override cap so tuning cannot silently explode request sizes.
 const MAX_MEGA_CHUNKS_PER_REQUEST_CAP: usize = 8;
+
+/// A dense set of already verified MEGA chunk MACs for one file size.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrustedChunkPlan(Arc<[Option<[u8; 16]>]>);
+
+impl TrustedChunkPlan {
+    /// Validates that the plan has exactly one entry for every MEGA chunk.
+    pub fn for_file_size(file_size: u64, chunks: &[Option<[u8; 16]>]) -> Result<Self> {
+        let expected = mega_chunk_boundaries(file_size).len();
+        if chunks.len() != expected {
+            return Err(Error::InvalidTrustedChunkPlan {
+                expected,
+                actual: chunks.len(),
+            });
+        }
+        Ok(Self(chunks.to_vec().into()))
+    }
+
+    pub fn as_slice(&self) -> &[Option<[u8; 16]>] {
+        &self.0
+    }
+
+    pub(crate) fn into_arc(self) -> Arc<[Option<[u8; 16]>]> {
+        self.0
+    }
+}
 
 fn normalize_max_mega_chunks_per_request(value: Option<usize>) -> usize {
     value
@@ -64,13 +90,12 @@ impl MegaChunkRun {
         self.last(chunks).end() - first.offset
     }
 
-    fn write_url(self, chunks: &[MegaChunk], base_url: &str, output: &mut String) {
+    fn url(self, chunks: &[MegaChunk], base_url: &TransferUrl) -> url::Url {
         let first = self.first(chunks);
         let last = self.last(chunks);
-        output.clear();
-        output.push_str(base_url);
-        output.push('/');
-        let _ = write!(output, "{}-{}", first.offset, last.end().saturating_sub(1));
+        let range = ByteRange::new(first.offset, last.end().saturating_sub(1))
+            .expect("MEGA chunk boundaries are non-empty");
+        base_url.for_range(range)
     }
 }
 
@@ -344,7 +369,7 @@ async fn sync_std_file_data(std_file: Arc<StdFile>) -> io::Result<()> {
 // ============================================================================
 
 struct DownloadContext {
-    base_url: Arc<str>,
+    base_url: TransferUrl,
     claim_cursor: Arc<ChunkClaimCursor>,
     chunks: Arc<[MegaChunk]>,
     trusted_chunks: Arc<[Option<[u8; 16]>]>,
@@ -367,13 +392,11 @@ fn resize_download_buffer(buffer_pool: &ChunkBufferPool, target_size: usize) -> 
 }
 
 async fn download_worker(client: &dyn HttpClient, ctx: DownloadContext) -> Result<()> {
-    let mut url_buffer = String::with_capacity(ctx.base_url.len() + 48);
     while let Some(run) =
         ctx.claim_cursor
             .claim(&ctx.chunks, &ctx.trusted_chunks, ctx.max_chunks_per_request)
     {
-        run.write_url(&ctx.chunks, &ctx.base_url, &mut url_buffer);
-        let mut response = client.get_str(&url_buffer).await?;
+        let mut response = client.get(run.url(&ctx.chunks, &ctx.base_url)).await?;
         let mut current_idx = run.start;
         let mut current_chunk = ctx.chunks[current_idx];
         let mut bytes_read = 0usize;
@@ -520,7 +543,7 @@ where
 }
 
 struct StreamingFileDownloadContext {
-    base_url: Arc<str>,
+    base_url: TransferUrl,
     claim_cursor: Arc<ChunkClaimCursor>,
     chunks: Arc<[MegaChunk]>,
     trusted_chunks: Arc<[Option<[u8; 16]>]>,
@@ -539,15 +562,13 @@ async fn stream_download_worker_to_file(
     client: &dyn HttpClient,
     ctx: StreamingFileDownloadContext,
 ) -> Result<()> {
-    let mut url_buffer = String::with_capacity(ctx.base_url.len() + 48);
     let mut chunk_buffer = Vec::new();
 
     while let Some(run) =
         ctx.claim_cursor
             .claim(&ctx.chunks, &ctx.trusted_chunks, ctx.max_chunks_per_request)
     {
-        run.write_url(&ctx.chunks, &ctx.base_url, &mut url_buffer);
-        let mut response = client.get_str(&url_buffer).await?;
+        let mut response = client.get(run.url(&ctx.chunks, &ctx.base_url)).await?;
         let mut current_idx = run.start;
         let mut current_chunk = ctx.chunks[current_idx];
         let mut remaining_in_chunk = current_chunk.length as usize;
@@ -749,7 +770,12 @@ where
         return Err(Error::NotAFileNode);
     }
 
-    let file_size = server_size;
+    let base_url = TransferUrl::parse(&base_url)?;
+    let server_size = FileSize::new(server_size);
+    let trusted_chunks = trusted_chunks
+        .map(|chunks| TrustedChunkPlan::for_file_size(server_size.bytes(), &chunks))
+        .transpose()?;
+    let file_size = server_size.bytes();
     let aes_key = node.aes_key;
     let aes_iv_8 = aes_iv;
 
@@ -776,12 +802,15 @@ where
 
     let chunks = Arc::<[MegaChunk]>::from(mega_chunk_boundaries(file_size));
     let num_chunks = chunks.len() as u64;
-    let trusted_chunks = trusted_chunks.unwrap_or_else(|| {
-        std::iter::repeat_with(|| None)
-            .take(num_chunks as usize)
-            .collect::<Vec<_>>()
-            .into()
-    });
+    let trusted_chunks = trusted_chunks.map_or_else(
+        || {
+            std::iter::repeat_with(|| None)
+                .take(num_chunks as usize)
+                .collect::<Vec<_>>()
+                .into()
+        },
+        TrustedChunkPlan::into_arc,
+    );
     let trusted_bytes = chunks
         .iter()
         .enumerate()
@@ -830,7 +859,6 @@ where
     // Cap workers so we never exceed the number of chunks or the configured maximum
     let num_workers = requested_workers.min(untrusted_chunks);
     let claim_cursor = Arc::new(ChunkClaimCursor::default());
-    let base_url: Arc<str> = base_url.into();
     let max_chunks_per_request = normalize_max_mega_chunks_per_request(max_chunks_per_request);
 
     // Channel: downloaders → processor
@@ -873,7 +901,7 @@ where
     let download_workers: Vec<_> = (0..num_workers)
         .map(|_| {
             let ctx = DownloadContext {
-                base_url: Arc::clone(&base_url),
+                base_url: base_url.clone(),
                 claim_cursor: Arc::clone(&claim_cursor),
                 chunks: Arc::clone(&chunks),
                 trusted_chunks: Arc::clone(&trusted_chunks),
@@ -967,7 +995,12 @@ pub(crate) async fn download_parallel_resumable_to_file_with_callbacks(
         return Err(Error::NotAFileNode);
     }
 
-    let file_size = server_size;
+    let base_url = TransferUrl::parse(&base_url)?;
+    let server_size = FileSize::new(server_size);
+    let trusted_chunks = trusted_chunks
+        .map(|chunks| TrustedChunkPlan::for_file_size(server_size.bytes(), &chunks))
+        .transpose()?;
+    let file_size = server_size.bytes();
     let aes_key = node.aes_key;
     let aes_iv_8 = aes_iv;
 
@@ -994,12 +1027,15 @@ pub(crate) async fn download_parallel_resumable_to_file_with_callbacks(
 
     let chunks = Arc::<[MegaChunk]>::from(mega_chunk_boundaries(file_size));
     let num_chunks = chunks.len() as u64;
-    let trusted_chunks = trusted_chunks.unwrap_or_else(|| {
-        std::iter::repeat_with(|| None)
-            .take(num_chunks as usize)
-            .collect::<Vec<_>>()
-            .into()
-    });
+    let trusted_chunks = trusted_chunks.map_or_else(
+        || {
+            std::iter::repeat_with(|| None)
+                .take(num_chunks as usize)
+                .collect::<Vec<_>>()
+                .into()
+        },
+        TrustedChunkPlan::into_arc,
+    );
     let trusted_bytes = chunks
         .iter()
         .enumerate()
@@ -1047,7 +1083,6 @@ pub(crate) async fn download_parallel_resumable_to_file_with_callbacks(
 
     let num_workers = requested_workers.min(untrusted_chunks);
     let claim_cursor = Arc::new(ChunkClaimCursor::default());
-    let base_url: Arc<str> = base_url.into();
     let max_chunks_per_request = normalize_max_mega_chunks_per_request(max_chunks_per_request);
     let progress_total = callbacks
         .as_ref()
@@ -1062,7 +1097,7 @@ pub(crate) async fn download_parallel_resumable_to_file_with_callbacks(
     let mut workers = Vec::with_capacity(num_workers);
     for _ in 0..num_workers {
         let ctx = StreamingFileDownloadContext {
-            base_url: Arc::clone(&base_url),
+            base_url: base_url.clone(),
             claim_cursor: Arc::clone(&claim_cursor),
             chunks: Arc::clone(&chunks),
             trusted_chunks: Arc::clone(&trusted_chunks),
@@ -1098,6 +1133,19 @@ pub(crate) async fn download_parallel_resumable_to_file_with_callbacks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trusted_chunk_plan_rejects_a_mismatched_chunk_count() {
+        let err = TrustedChunkPlan::for_file_size(800_000, &[]).unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::InvalidTrustedChunkPlan {
+                expected: 4,
+                actual: 0
+            }
+        ));
+    }
     use std::collections::HashSet;
     use std::pin::Pin;
     use std::sync::Mutex;
@@ -1602,6 +1650,33 @@ mod tests {
             }
         }
         SharedWriter::with_data(data)
+    }
+
+    #[tokio::test]
+    async fn resumable_download_rejects_mismatched_trusted_chunk_count_before_workers() {
+        let fixture = resumable_fixture(800_000);
+        let http = MockHttpClient::new(fixture.encrypted.clone());
+        let writer = SharedWriter::default();
+
+        let error = download_parallel_resumable(
+            &http,
+            &fixture.node,
+            "http://example.test/file".to_owned(),
+            fixture.plaintext.len() as u64,
+            writer,
+            2,
+            None,
+            None,
+            Some(Vec::new().into()),
+            None,
+            *fixture.node.aes_iv.as_ref().unwrap(),
+            *fixture.node.condensed_mac.as_ref().unwrap(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidTrustedChunkPlan { .. }));
+        assert!(http.requests().is_empty());
     }
 
     fn request_overlaps_chunk(request: (u64, u64), chunk: MegaChunk) -> bool {
